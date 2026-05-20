@@ -490,7 +490,7 @@ SELECT * FROM pgredis."JOB_STATS"();
 | `pg_redis.flush_batch_size` | int | `1000` | Max dirty entries flushed per tick (reserved). |
 | `pg_redis.ttl_cleanup_interval` | int seconds | `30` | Default TTL sweep cadence for the `ttl_cleanup` job. |
 | `pg_redis.max_key_size` | int bytes | `1024` | Reject keys longer than this. |
-| `pg_redis.max_value_size` | int bytes | `1048576` | Reject values longer than this. |
+| `pg_redis.max_value_size` | int bytes | `1048576` | Reject values longer than this. Under `storage_mode=shared`, hash-field values have a tighter hard cap of `65535` bytes (bucket width) — oversize HSET fails with `ERRCODE_PROGRAM_LIMIT_EXCEEDED`. |
 | `pg_redis.enable_background_worker` | bool | `off` | Enable the worker (requires `shared_preload_libraries`). |
 | `pg_redis.shared_max_memory` | int MB | `256` | Cap on the DSA segment backing variable-size payloads in `storage_mode=shared`. Postmaster-only. |
 | `pg_redis.dirty_ring_size` | int slots | `65536` | Slots in the shared dirty-ring used by `async_table`. Postmaster-only. |

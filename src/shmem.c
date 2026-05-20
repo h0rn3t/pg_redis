@@ -215,29 +215,46 @@ pg_redis_shmem_dsa(void)
 
 	/* Lazy create/attach: the first backend to touch DSA in shared mode
 	 * creates the segment under the startup_lock; subsequent backends just
-	 * attach to the published handle. */
+	 * attach to the published handle.
+	 *
+	 * dsa_create / dsa_attach / dsa_pin / dsa_pin_mapping can ereport (OOM on
+	 * mmap, dsm handle invalidated). Wrap in PG_TRY so a longjmp doesn't
+	 * leave CurrentResourceOwner=NULL or startup_lock held. */
 	LWLockAcquire(PgRedisShared->startup_lock, LW_EXCLUSIVE);
-	if (PgRedisShared->dsa == DSM_HANDLE_INVALID)
-	{
-		dsa_area   *area = dsa_create(PgRedisShared->lock_tranche_id);
 
-		/* DSA segments are session-pinned by default. We need them to
-		 * survive the creating backend's lifetime — pin so the segment
-		 * stays alive for the cluster. */
-		dsa_pin(area);
-		dsa_pin_mapping(area);
-		PgRedisShared->dsa = dsa_get_handle(area);
-		cached_dsa = area;
-		elog(LOG, "pg_redis: DSA created, handle=%u, area=%p",
-			 (unsigned) PgRedisShared->dsa, (void *) area);
-	}
-	else
+	PG_TRY();
 	{
-		cached_dsa = dsa_attach(PgRedisShared->dsa);
-		dsa_pin_mapping(cached_dsa);
-		elog(LOG, "pg_redis: DSA attached, handle=%u, area=%p",
-			 (unsigned) PgRedisShared->dsa, (void *) cached_dsa);
+		if (PgRedisShared->dsa == DSM_HANDLE_INVALID)
+		{
+			dsa_area   *area = dsa_create(PgRedisShared->lock_tranche_id);
+
+			/* DSA segments are session-pinned by default. We need them to
+			 * survive the creating backend's lifetime — pin so the segment
+			 * stays alive for the cluster. */
+			dsa_pin(area);
+			dsa_pin_mapping(area);
+			PgRedisShared->dsa = dsa_get_handle(area);
+			cached_dsa = area;
+			elog(LOG, "pg_redis: DSA created, handle=%u, area=%p",
+				 (unsigned) PgRedisShared->dsa, (void *) area);
+		}
+		else
+		{
+			cached_dsa = dsa_attach(PgRedisShared->dsa);
+			dsa_pin_mapping(cached_dsa);
+			elog(LOG, "pg_redis: DSA attached, handle=%u, area=%p",
+				 (unsigned) PgRedisShared->dsa, (void *) cached_dsa);
+		}
 	}
+	PG_CATCH();
+	{
+		LWLockRelease(PgRedisShared->startup_lock);
+		CurrentResourceOwner = old_owner;
+		MemoryContextSwitchTo(old_ctx);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+
 	LWLockRelease(PgRedisShared->startup_lock);
 
 	CurrentResourceOwner = old_owner;

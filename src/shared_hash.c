@@ -84,8 +84,12 @@ find_bucket(PgRedisSharedHashTable *t,
 	int64		mask = t->bucket_count - 1;
 	int64		idx = bucket_index(field, fieldlen, t->bucket_count);
 	int64		first_tomb = -1;
+	int64		probes;
 
-	for (;;)
+	/* Bounded probe: with the grow-at-0.7 invariant there is always an EMPTY
+	 * bucket within bucket_count steps. The bound is defensive — if a future
+	 * regression breaks the invariant we'd otherwise loop forever. */
+	for (probes = 0; probes < t->bucket_count; probes++)
 	{
 		PgRedisSharedHashBucket *b = &buckets[idx];
 
@@ -106,6 +110,20 @@ find_bucket(PgRedisSharedHashTable *t,
 		}
 		idx = (idx + 1) & mask;
 	}
+
+	/* Exhausted the table without finding an empty slot or match. If we saw a
+	 * tombstone we can still insert there; otherwise the table is saturated
+	 * and we have to error out. */
+	if (first_tomb >= 0)
+	{
+		*was_found = false;
+		return first_tomb;
+	}
+	ereport(ERROR,
+			(errcode(ERRCODE_INTERNAL_ERROR),
+			 errmsg("pg_redis: shared hash table saturated (no empty bucket in %ld probes)",
+					(long) t->bucket_count)));
+	return -1;					/* unreachable, silences compiler */
 }
 
 /*
@@ -255,6 +273,16 @@ pg_redis_shared_hash_set(dsa_pointer *inout_table_dsa,
 	bool		was_found;
 	int64		idx;
 	PgRedisSharedHashBucket *b;
+
+	/* Bucket width caps the per-field value length at uint16. Reject oversize
+	 * values up front so no DSA chunk is allocated for a truncated record. */
+	if (value_len > UINT16_MAX)
+		ereport(ERROR,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("pg_redis: hash field value length %zu exceeds maximum %u",
+						value_len, (unsigned) UINT16_MAX),
+				 errhint("Shared-mode hash field values are bounded by the "
+						 "PgRedisSharedHashBucket width.")));
 
 	/* Lazy table allocation: first HSET on this key. */
 	if (table_dsa == InvalidDsaPointer)
@@ -480,6 +508,8 @@ pg_redis_shared_hash_materialize(dsa_pointer table_dsa)
 		if (b->field_len > PG_REDIS_MAX_FIELD_SIZE)
 			continue;				/* defensive: skip corrupt bucket */
 		field_bytes = (const char *) pg_redis_shared_addr(b->field_dsa);
+		if (field_bytes == NULL)
+			continue;				/* defensive: skip bucket with NULL-resolving field_dsa */
 		value_bytes = (const char *) pg_redis_shared_addr(b->value_dsa);
 		memcpy(fieldbuf, field_bytes, b->field_len);
 		fieldbuf[b->field_len] = '\0';

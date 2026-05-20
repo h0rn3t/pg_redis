@@ -184,19 +184,31 @@ populate_shared_from_scratch(PgRedisSharedEntry *se, const PgRedisEntry *e)
 
 				if (h != NULL && h->fields != NULL)
 				{
-					hash_seq_init(&s, h->fields);
-					while ((f = (PgRedisHashField *) hash_seq_search(&s)) != NULL)
+					PG_TRY();
 					{
-						bool		was_new;
+						hash_seq_init(&s, h->fields);
+						while ((f = (PgRedisHashField *) hash_seq_search(&s)) != NULL)
+						{
+							bool		was_new;
 
-						pg_redis_shared_hash_set(&table_dsa,
-												 f->field, strlen(f->field),
-												 (const unsigned char *) f->value,
-												 f->value_len,
-												 &was_new);
-						if (was_new)
-							count++;
+							pg_redis_shared_hash_set(&table_dsa,
+													 f->field, strlen(f->field),
+													 (const unsigned char *) f->value,
+													 f->value_len,
+													 &was_new);
+							if (was_new)
+								count++;
+						}
 					}
+					PG_CATCH();
+					{
+						/* Free the partially built table so OOM mid-rebuild
+						 * doesn't leak the DSA chunks we already allocated. */
+						hash_seq_term(&s);
+						pg_redis_shared_hash_free(table_dsa);
+						PG_RE_THROW();
+					}
+					PG_END_TRY();
 				}
 				se->value.hash.table = table_dsa;
 				se->value.hash.field_count = count;
@@ -217,10 +229,20 @@ populate_shared_from_scratch(PgRedisSharedEntry *se, const PgRedisEntry *e)
 
 				if (l != NULL)
 				{
-					for (n = l->head; n != NULL; n = n->next)
-						(void) pg_redis_shared_list_rpush(&meta,
-														  (const unsigned char *) n->value,
-														  n->value_len);
+					PG_TRY();
+					{
+						for (n = l->head; n != NULL; n = n->next)
+							(void) pg_redis_shared_list_rpush(&meta,
+															  (const unsigned char *) n->value,
+															  n->value_len);
+					}
+					PG_CATCH();
+					{
+						/* Free any nodes already appended before re-throwing. */
+						pg_redis_shared_list_free(&meta);
+						PG_RE_THROW();
+					}
+					PG_END_TRY();
 				}
 				se->value.list.head = meta.head;
 				se->value.list.tail = meta.tail;
@@ -402,6 +424,14 @@ pg_redis_shared_store_reset_all(void)
 	int			i;
 	bool		found;
 
+	/*
+	 * Caller contract: every partition LWLock MUST already be held
+	 * LW_EXCLUSIVE before invoking this function. The only caller today
+	 * (pg_redis_flushall) acquires them via
+	 * pg_redis_shmem_acquire_all_partition_locks_exclusive() before calling
+	 * here and releases them after returning. Acquiring the locks again here
+	 * would deadlock the backend against itself (LWLocks are not reentrant).
+	 */
 	if (ks == NULL)
 		return 0;
 

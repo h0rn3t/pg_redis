@@ -196,6 +196,8 @@ pg_redis_shared_list_lpop(PgRedisSharedListMeta *meta,
 	if (head_p == InvalidDsaPointer)
 		return false;
 	head = (PgRedisSharedListNode *) pg_redis_shared_addr(head_p);
+	if (head == NULL)
+		return false;				/* defensive: bucket present but DSA resolve failed */
 
 	*out_value = copy_value_out(head, out_len);
 	*out_ord = head->ord;
@@ -234,6 +236,8 @@ pg_redis_shared_list_rpop(PgRedisSharedListMeta *meta,
 	if (tail_p == InvalidDsaPointer)
 		return false;
 	tail = (PgRedisSharedListNode *) pg_redis_shared_addr(tail_p);
+	if (tail == NULL)
+		return false;				/* defensive: bucket present but DSA resolve failed */
 
 	*out_value = copy_value_out(tail, out_len);
 	*out_ord = tail->ord;

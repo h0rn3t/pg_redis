@@ -1264,6 +1264,17 @@ pg_redis_persistence_async_drain(int max_events)
 
 	if (SPI_connect() != SPI_OK_CONNECT)
 	{
+		/* Drained events own DSA-spill payloads — release before raising so
+		 * SPI_connect failure doesn't leak shared memory. */
+		for (int i = 0; i < n; i++)
+		{
+			if (events[i].dsa_overflow)
+			{
+				pg_redis_shared_pfree(events[i].dsa_payload);
+				events[i].dsa_payload = InvalidDsaPointer;
+				events[i].dsa_overflow = 0;
+			}
+		}
 		PopActiveSnapshot();
 		pfree(events);
 		ereport(ERROR,
@@ -1271,6 +1282,11 @@ pg_redis_persistence_async_drain(int max_events)
 				 errmsg("pg_redis: SPI_connect failed in async drain")));
 	}
 
+	/* From here on, an ereport in SPI execution would leak the spill payloads
+	 * attached to drained events — guard with PG_TRY so PG_CATCH frees them
+	 * before propagating. */
+	PG_TRY();
+	{
 	vec_init(&store_keys);
 	vec_init(&store_types);
 	vec_init(&store_values);
@@ -1499,6 +1515,24 @@ pg_redis_persistence_async_drain(int max_events)
 
 	SPI_finish();
 	PopActiveSnapshot();
+	}
+	PG_CATCH();
+	{
+		/* Always release drained spill payloads — they're unreferenced from
+		 * the ring now, so leaving them allocated would leak DSA forever. */
+		for (int i = 0; i < n; i++)
+		{
+			if (events[i].dsa_overflow)
+			{
+				pg_redis_shared_pfree(events[i].dsa_payload);
+				events[i].dsa_payload = InvalidDsaPointer;
+				events[i].dsa_overflow = 0;
+			}
+		}
+		pfree(events);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
 
 	/* Free DSA-spilled payloads. Inline events use the event slot's own
 	 * inline_bytes; only spilled events have a separate DSA allocation that
