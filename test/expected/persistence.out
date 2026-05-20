@@ -1,4 +1,4 @@
--- sync_table write-through + SAVE/snapshots + rollback semantics
+-- sync_table batched pre-commit flush + SAVE/snapshots + rollback semantics
 CREATE EXTENSION pg_redis;
 SHOW pg_redis.persistence_mode;
  pg_redis.persistence_mode 
@@ -6,20 +6,22 @@ SHOW pg_redis.persistence_mode;
  sync_table
 (1 row)
 
--- SET writes a row in pgredis.store
+-- SET writes a row in pgredis.store (TLV-encoded bytea: 0x01 || u32 len || payload)
 SELECT pgredis."SET"('p:1', 'one');
  SET 
 -----
  t
 (1 row)
 
-SELECT key, type, value FROM pgredis.store WHERE key = 'p:1';
- key |  type  |      value       
------+--------+------------------
- p:1 | string | {"value": "one"}
+SELECT key, type, length(value) AS vlen, get_byte(value, 0) AS tag
+  FROM pgredis.store WHERE key = 'p:1';
+ key |  type  | vlen | tag 
+-----+--------+------+-----
+ p:1 | string |    8 |   1
 (1 row)
 
--- HSET shape
+-- HSET shape: parent row in pgredis.store with NULL value; one row per field
+-- in pgredis.hash_fields.
 SELECT pgredis."HSET"('p:h', 'name', 'Alice');
  HSET 
 ------
@@ -32,15 +34,22 @@ SELECT pgredis."HSET"('p:h', 'age', '30');
  t
 (1 row)
 
-SELECT type, value->'fields'->>'name' AS name,
-              value->'fields'->>'age' AS age
-  FROM pgredis.store WHERE key = 'p:h';
- type | name  | age 
-------+-------+-----
- hash | Alice | 30
+SELECT type, value IS NULL AS parent_null FROM pgredis.store WHERE key = 'p:h';
+ type | parent_null 
+------+-------------
+ hash | t
 (1 row)
 
--- RPUSH shape (list ordering preserved)
+SELECT field, convert_from(value, 'utf8') AS v
+  FROM pgredis.hash_fields WHERE key = 'p:h' ORDER BY field;
+ field |   v   
+-------+-------
+ age   | 30
+ name  | Alice
+(2 rows)
+
+-- RPUSH shape: parent row + per-element rows in pgredis.list_items with
+-- stable ordinals (RPUSH appends starting at 0, then max+1).
 SELECT pgredis."RPUSH"('p:l', 'a');
  RPUSH 
 -------
@@ -53,15 +62,21 @@ SELECT pgredis."RPUSH"('p:l', 'b');
      2
 (1 row)
 
-SELECT type, jsonb_array_length(value->'items') AS n,
-              value->'items'->>0 AS first
-  FROM pgredis.store WHERE key = 'p:l';
- type | n | first 
-------+---+-------
- list | 2 | a
+SELECT type, value IS NULL AS parent_null FROM pgredis.store WHERE key = 'p:l';
+ type | parent_null 
+------+-------------
+ list | t
 (1 row)
 
--- DEL removes the durable row
+SELECT ord, convert_from(value, 'utf8') AS v
+  FROM pgredis.list_items WHERE key = 'p:l' ORDER BY ord;
+ ord | v 
+-----+---
+   0 | a
+   1 | b
+(2 rows)
+
+-- DEL removes the durable row (and via FK CASCADE, any child rows).
 SELECT pgredis."DEL"('p:1');
  DEL 
 -----
@@ -69,6 +84,24 @@ SELECT pgredis."DEL"('p:1');
 (1 row)
 
 SELECT count(*) FROM pgredis.store WHERE key = 'p:1';   -- 0
+ count 
+-------
+     0
+(1 row)
+
+SELECT pgredis."DEL"('p:h');
+ DEL 
+-----
+ t
+(1 row)
+
+SELECT count(*) FROM pgredis.store WHERE key = 'p:h';   -- 0
+ count 
+-------
+     0
+(1 row)
+
+SELECT count(*) FROM pgredis.hash_fields WHERE key = 'p:h'; -- 0 (cascade)
  count 
 -------
      0

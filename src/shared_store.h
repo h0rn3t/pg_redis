@@ -39,4 +39,9 @@ extern void pg_redis_shared_store_writeback(PgRedisEntry *scratch);
  * shared_store_remove and from FLUSHALL. */
 extern void pg_redis_shared_entry_release_payloads(PgRedisSharedEntry *se);
 
+/* FLUSHALL helper for shared mode. Iterates every entry in the shared HTAB,
+ * frees its DSA payloads, and removes the entry. Caller MUST hold every
+ * partition LWLock exclusively. Returns the number of entries removed. */
+extern int	pg_redis_shared_store_reset_all(void);
+
 #endif							/* PG_REDIS_SHARED_STORE_H */

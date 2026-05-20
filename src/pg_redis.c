@@ -32,6 +32,8 @@
 #include "jobs.h"
 #include "shmem.h"
 #include "bgworker.h"
+#include "shared_store.h"
+#include "dirty_ring.h"
 
 PG_MODULE_MAGIC;
 
@@ -321,6 +323,17 @@ argtext_to_pstring(text *t, Size *out_len, bool check_key)
 	return p;
 }
 
+/* Return the MemoryContext that should own value buffers attached to a
+ * PgRedisEntry: long-lived PgRedisMemoryContext in session mode (the entry
+ * IS the persistent store); CurrentMemoryContext in shared mode (the entry
+ * is a scratch valid only until the SQL statement ends). */
+static inline MemoryContext
+entry_owning_mcxt(void)
+{
+	return pg_redis_storage_is_shared() ? CurrentMemoryContext
+		: pg_redis_memcxt();
+}
+
 /* -------------------------------------------------------------------------
  * Strings / generic
  * ------------------------------------------------------------------------- */
@@ -362,6 +375,18 @@ pg_redis_set(PG_FUNCTION_ARGS)
 	e->deleted = false;
 
 	pg_redis_mark_dirty(e);
+
+	if (pg_redis_storage_is_shared())
+	{
+		/* Shared mode: mark_dirty copied the bytes into DSA. The scratch's
+		 * string_value field would otherwise dangle on `val` (PgRedisMemoryContext);
+		 * release it so the bytes don't accumulate across thousands of SETs on
+		 * one connection. */
+		pfree(val);
+		e->value.string_value = NULL;
+		e->string_len = 0;
+	}
+
 	pg_redis_free_cstring_stack(keybuf, key);
 	PG_RETURN_BOOL(true);
 }
@@ -609,7 +634,7 @@ pg_redis_hset(PG_FUNCTION_ARGS)
 	if (is_new || e->value.hash_value == NULL)
 	{
 		e->type = PG_REDIS_TYPE_HASH;
-		e->value.hash_value = pg_redis_hash_create();
+		e->value.hash_value = pg_redis_hash_create_in(entry_owning_mcxt());
 	}
 
 	new_field = pg_redis_hash_set(e->value.hash_value, field, val, val_len);
@@ -790,7 +815,7 @@ list_push(text *key_t, text *val_t, bool left)
 	if (is_new || e->value.list_value == NULL)
 	{
 		e->type = PG_REDIS_TYPE_LIST;
-		e->value.list_value = pg_redis_list_create();
+		e->value.list_value = pg_redis_list_create_in(entry_owning_mcxt());
 	}
 
 	if (left)
@@ -960,8 +985,30 @@ PG_FUNCTION_INFO_V1(pg_redis_flushall);
 Datum
 pg_redis_flushall(PG_FUNCTION_ARGS)
 {
-	pg_redis_store_reset();
-	pg_redis_persistence_flushall();
+	if (pg_redis_storage_is_shared())
+	{
+		/* Shared mode: take every partition lock exclusively, blow away the
+		 * shared HTAB, discard pending dirty-ring events, and TRUNCATE the
+		 * durable tables. After release every backend's next access sees
+		 * an empty keyspace and zero pending events. */
+		PG_TRY();
+		{
+			pg_redis_shmem_acquire_all_partition_locks_exclusive();
+			(void) pg_redis_shared_store_reset_all();
+			(void) pg_redis_dirty_ring_drop_all_pending();
+			pg_redis_persistence_flushall();
+		}
+		PG_FINALLY();
+		{
+			pg_redis_shmem_release_all_partition_locks();
+		}
+		PG_END_TRY();
+	}
+	else
+	{
+		pg_redis_store_reset();
+		pg_redis_persistence_flushall();
+	}
 	PG_RETURN_BOOL(true);
 }
 

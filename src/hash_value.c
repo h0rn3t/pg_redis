@@ -9,19 +9,20 @@
 #include "utils.h"
 
 PgRedisHash *
-pg_redis_hash_create(void)
+pg_redis_hash_create_in(MemoryContext mcxt)
 {
 	MemoryContext old;
 	PgRedisHash *h;
 	HASHCTL		ctl;
 
-	old = MemoryContextSwitchTo(pg_redis_memcxt());
+	old = MemoryContextSwitchTo(mcxt);
 	h = (PgRedisHash *) palloc0(sizeof(PgRedisHash));
+	h->mcxt = mcxt;
 
 	MemSet(&ctl, 0, sizeof(ctl));
 	ctl.keysize = sizeof(((PgRedisHashField *) 0)->field);
 	ctl.entrysize = sizeof(PgRedisHashField);
-	ctl.hcxt = pg_redis_memcxt();
+	ctl.hcxt = mcxt;
 
 	h->fields = hash_create("pg_redis_hash_fields",
 							16,
@@ -29,6 +30,12 @@ pg_redis_hash_create(void)
 							HASH_ELEM | HASH_STRINGS | HASH_CONTEXT);
 	MemoryContextSwitchTo(old);
 	return h;
+}
+
+PgRedisHash *
+pg_redis_hash_create(void)
+{
+	return pg_redis_hash_create_in(pg_redis_memcxt());
 }
 
 void
@@ -76,6 +83,7 @@ pg_redis_hash_set(PgRedisHash *h, const char *field,
 	PgRedisHashField *f;
 	char		fieldbuf[PG_REDIS_MAX_FIELD_SIZE + 1];
 	Size		flen = strlen(field);
+	MemoryContext old;
 
 	if (flen > PG_REDIS_MAX_FIELD_SIZE)
 		ereport(ERROR,
@@ -102,7 +110,18 @@ pg_redis_hash_set(PgRedisHash *h, const char *field,
 		h->memory_usage += sizeof(PgRedisHashField);
 	}
 
-	f->value = pg_redis_palloc_string(value, value_len);
+	{
+		char	   *dst;
+
+		old = MemoryContextSwitchTo(h->mcxt);
+		dst = (char *) palloc(value_len + 1);
+		MemoryContextSwitchTo(old);
+
+		if (value_len > 0 && value != NULL)
+			memcpy(dst, value, value_len);
+		dst[value_len] = '\0';
+		f->value = dst;
+	}
 	f->value_len = value_len;
 	f->dirty = true;
 	h->memory_usage += value_len;
@@ -171,9 +190,11 @@ pg_redis_hash_del(PgRedisHash *h, const char *field)
 		h->field_count--;
 
 	/* Record a tombstone so the next flush deletes the field's durable row.
-	 * Allocated in PgRedisMemoryContext so it survives the command's
-	 * CurrentMemoryContext tear-down. */
-	old = MemoryContextSwitchTo(pg_redis_memcxt());
+	 * Allocated in the hash's owning context — for session-mode that is the
+	 * long-lived PgRedisMemoryContext (so it survives statement teardown);
+	 * for shared-mode scratches it's the statement context, which is fine
+	 * because writeback consumes the tombstone before the statement ends. */
+	old = MemoryContextSwitchTo(h->mcxt);
 	t = (PgRedisHashTombstone *) palloc(sizeof(PgRedisHashTombstone));
 	t->field = (char *) palloc(flen + 1);
 	memcpy(t->field, field, flen);

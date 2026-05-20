@@ -31,6 +31,20 @@
 static bool persistence_loaded = false;
 static bool persistence_initialized = false;
 
+/* Per-backend counter of async dirty-ring events published in the current
+ * transaction. Bumped by mark_dirty/mark_deleted in async mode; consulted by
+ * the xact callback on ABORT to warn that the writes have already been ack'd
+ * to the BGW (the ROLLBACK does not undo them). Reset at PRE_COMMIT and
+ * ABORT. */
+static int async_published_in_xact = 0;
+
+void
+pg_redis_persistence_note_async_publish(int n)
+{
+	if (n > 0)
+		async_published_in_xact += n;
+}
+
 /* Cached SPI plans (per-backend). Prepared lazily on first use with
  * SPI_keepplan so they survive SPI_finish. All plans take array parameters
  * and are invoked via unnest() so a single statement covers an entire batch. */
@@ -41,11 +55,18 @@ static SPIPlanPtr plan_hash_field_delete = NULL;
 static SPIPlanPtr plan_list_item_insert = NULL;
 static SPIPlanPtr plan_list_item_delete = NULL;
 
+/*
+ * A drain batch can contain multiple events for the same key (e.g. warmup
+ * SET followed by measurement SET, or rapid INCR/SET on a counter). Postgres
+ * rejects "ON CONFLICT DO UPDATE" if two input rows share the conflict key,
+ * so dedupe in the SELECT keeping the last event by ordinality.
+ */
 static const char *SQL_STORE_UPSERT =
 	"INSERT INTO pgredis.store (key, type, value, expire_at, version, updated_at) "
-	"SELECT k, t, v, ea, ver, now() "
+	"SELECT DISTINCT ON (k) k, t, v, ea, ver, now() "
 	"  FROM unnest($1::text[], $2::text[], $3::bytea[], $4::timestamptz[], $5::bigint[]) "
-	"       AS u(k, t, v, ea, ver) "
+	"       WITH ORDINALITY AS u(k, t, v, ea, ver, i) "
+	" ORDER BY k, i DESC "
 	"ON CONFLICT (key) DO UPDATE SET "
 	"  type = EXCLUDED.type, "
 	"  value = EXCLUDED.value, "
@@ -58,7 +79,10 @@ static const char *SQL_STORE_DELETE =
 
 static const char *SQL_HASH_FIELD_UPSERT =
 	"INSERT INTO pgredis.hash_fields (key, field, value) "
-	"SELECT k, f, v FROM unnest($1::text[], $2::text[], $3::bytea[]) AS u(k, f, v) "
+	"SELECT DISTINCT ON (k, f) k, f, v "
+	"  FROM unnest($1::text[], $2::text[], $3::bytea[]) "
+	"       WITH ORDINALITY AS u(k, f, v, i) "
+	" ORDER BY k, f, i DESC "
 	"ON CONFLICT (key, field) DO UPDATE SET value = EXCLUDED.value";
 
 static const char *SQL_HASH_FIELD_DELETE =
@@ -136,6 +160,7 @@ pg_redis_xact_cb_persistence(XactEvent event, void *arg)
 				 * bookkeeping that might have leaked in from a sync path. */
 				pg_redis_dirty_clear();
 				pg_redis_pending_deletes_clear();
+				async_published_in_xact = 0;
 				break;
 			}
 			if (mode == PG_REDIS_PERSIST_SYNC_TABLE ||
@@ -162,8 +187,16 @@ pg_redis_xact_cb_persistence(XactEvent event, void *arg)
 				/* Shared keyspace is authoritative — in-memory writes
 				 * acked before the abort remain visible to other backends.
 				 * Do NOT invalidate the load flag (no re-load needed). */
+				if (async_published_in_xact > 0)
+					ereport(WARNING,
+							(errcode(ERRCODE_WARNING),
+							 errmsg("pg_redis: %d async event(s) already published to dirty-ring will NOT be rolled back",
+									async_published_in_xact),
+							 errhint("In async_table mode, mutations are durable independently of the user's transaction; ROLLBACK does not undo them.")));
+				async_published_in_xact = 0;
 				break;
 			}
+			async_published_in_xact = 0;
 			/* Force a re-load next time so the in-memory view re-syncs with
 			 * the (rolled-back) durable state. */
 			persistence_loaded = false;
@@ -941,6 +974,9 @@ void
 pg_redis_persistence_load_if_needed(void)
 {
 	PgRedisPersistenceMode m;
+	PgRedisSharedHeader *h;
+	bool		shared_mode;
+	bool		need_load = true;
 
 	if (persistence_loaded)
 		return;
@@ -954,23 +990,62 @@ pg_redis_persistence_load_if_needed(void)
 		return;
 	}
 
-	if (SPI_connect() != SPI_OK_CONNECT)
-		return;					/* best-effort; mark loaded only on success */
+	shared_mode = pg_redis_storage_is_shared();
+	h = pg_redis_shmem_header();
 
-	PG_TRY();
+	/* Shared mode: gate on the cluster-wide loaded flag. The first backend to
+	 * touch the keyspace performs the load under startup_lock; subsequent
+	 * backends short-circuit. The per-backend `persistence_loaded` flag is
+	 * kept as a fast-path cache so we don't take the lock on every command. */
+	if (shared_mode && h != NULL)
 	{
-		load_strings_and_ints();
-		load_hashes();
-		load_lists();
+		if (pg_atomic_read_u32(&h->loaded) != 0)
+		{
+			persistence_loaded = true;
+			return;
+		}
+
+		LWLockAcquire(h->startup_lock, LW_EXCLUSIVE);
+		if (pg_atomic_read_u32(&h->loaded) != 0)
+		{
+			/* Lost the race — another backend loaded it first. */
+			need_load = false;
+		}
 	}
-	PG_CATCH();
+
+	if (need_load)
 	{
+		if (SPI_connect() != SPI_OK_CONNECT)
+		{
+			if (shared_mode && h != NULL)
+				LWLockRelease(h->startup_lock);
+			return;				/* best-effort; mark loaded only on success */
+		}
+
+		PG_TRY();
+		{
+			load_strings_and_ints();
+			load_hashes();
+			load_lists();
+		}
+		PG_CATCH();
+		{
+			SPI_finish();
+			if (shared_mode && h != NULL)
+				LWLockRelease(h->startup_lock);
+			PG_RE_THROW();
+		}
+		PG_END_TRY();
+
 		SPI_finish();
-		PG_RE_THROW();
-	}
-	PG_END_TRY();
 
-	SPI_finish();
+		if (shared_mode && h != NULL)
+			pg_atomic_write_u32(&h->loaded, 1);
+	}
+
+	if (shared_mode && h != NULL)
+		LWLockRelease(h->startup_lock);
+
 	persistence_loaded = true;
 }
 
@@ -1442,23 +1517,61 @@ pg_redis_persistence_async_drain(int max_events)
 	return n;
 }
 
+/*
+ * Synchronous drain of the dirty-ring, used by the sync_flush producer
+ * fallback in [src/dirty_ring.c] when the ring is full. Adapts its
+ * transaction scope to the caller:
+ *
+ *   - Called from inside a user statement (the typical producer path,
+ *     mid-HSET/SET/etc.), a transaction is already active. We MUST NOT
+ *     call StartTransactionCommand in that state (it raises
+ *     "unexpected state STARTED" and aborts the user's xact). Instead,
+ *     run the drain inside an internal subtransaction so a drain failure
+ *     stays scoped to itself and the outer user xact survives.
+ *
+ *   - Called from a context with no active transaction (no current caller,
+ *     but kept stable for future non-xact callers), use a top-level
+ *     StartTransactionCommand/CommitTransactionCommand pair.
+ *
+ * Returns the number of events drained. Re-throws on internal failure,
+ * after releasing the subtransaction (or aborting the top-level xact) it
+ * opened.
+ */
 int
 pg_redis_persistence_sync_drain(void)
 {
 	int			drained;
 
-	StartTransactionCommand();
-	PG_TRY();
+	if (IsTransactionState())
 	{
-		drained = pg_redis_persistence_async_drain(0);
+		BeginInternalSubTransaction(NULL);
+		PG_TRY();
+		{
+			drained = pg_redis_persistence_async_drain(0);
+			ReleaseCurrentSubTransaction();
+		}
+		PG_CATCH();
+		{
+			RollbackAndReleaseCurrentSubTransaction();
+			PG_RE_THROW();
+		}
+		PG_END_TRY();
 	}
-	PG_CATCH();
+	else
 	{
-		AbortCurrentTransaction();
-		PG_RE_THROW();
+		StartTransactionCommand();
+		PG_TRY();
+		{
+			drained = pg_redis_persistence_async_drain(0);
+		}
+		PG_CATCH();
+		{
+			AbortCurrentTransaction();
+			PG_RE_THROW();
+		}
+		PG_END_TRY();
+		CommitTransactionCommand();
 	}
-	PG_END_TRY();
-	CommitTransactionCommand();
 	return drained;
 }
 
@@ -1478,6 +1591,17 @@ pg_redis_persistence_flushall(void)
 		}
 	}
 	persistence_loaded = true;
+
+	/* Shared mode: the keyspace is now authoritative-empty across the
+	 * cluster. Mark the shared loaded flag so other backends don't try to
+	 * re-load from the (now empty) durable tables. */
+	if (pg_redis_storage_is_shared())
+	{
+		PgRedisSharedHeader *h = pg_redis_shmem_header();
+
+		if (h != NULL)
+			pg_atomic_write_u32(&h->loaded, 1);
+	}
 }
 
 /* -------------------------------------------------------------------------

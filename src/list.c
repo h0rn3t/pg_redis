@@ -8,11 +8,12 @@
 #include "utils.h"
 
 PgRedisList *
-pg_redis_list_create(void)
+pg_redis_list_create_in(MemoryContext mcxt)
 {
-	MemoryContext old = MemoryContextSwitchTo(pg_redis_memcxt());
+	MemoryContext old = MemoryContextSwitchTo(mcxt);
 	PgRedisList *l = (PgRedisList *) palloc0(sizeof(PgRedisList));
 
+	l->mcxt = mcxt;
 	/* ord_initialized=false signals "first push picks ord=0". After at least
 	 * one push has happened, min_ord/max_ord are authoritative. */
 	l->min_ord = 0;
@@ -21,6 +22,12 @@ pg_redis_list_create(void)
 	l->pending_delete_ords = NULL;
 	MemoryContextSwitchTo(old);
 	return l;
+}
+
+PgRedisList *
+pg_redis_list_create(void)
+{
+	return pg_redis_list_create_in(pg_redis_memcxt());
 }
 
 void
@@ -57,9 +64,9 @@ pg_redis_list_free(PgRedisList *list)
 }
 
 static PgRedisListNode *
-new_node(const char *value, Size len)
+new_node(MemoryContext mcxt, const char *value, Size len)
 {
-	MemoryContext old = MemoryContextSwitchTo(pg_redis_memcxt());
+	MemoryContext old = MemoryContextSwitchTo(mcxt);
 	PgRedisListNode *n = (PgRedisListNode *) palloc0(sizeof(PgRedisListNode));
 
 	n->value = (char *) palloc(len + 1);
@@ -75,7 +82,7 @@ new_node(const char *value, Size len)
 int64
 pg_redis_list_lpush(PgRedisList *list, const char *value, Size len)
 {
-	PgRedisListNode *n = new_node(value, len);
+	PgRedisListNode *n = new_node(list->mcxt, value, len);
 
 	if (!list->ord_initialized)
 	{
@@ -105,7 +112,7 @@ pg_redis_list_lpush(PgRedisList *list, const char *value, Size len)
 int64
 pg_redis_list_rpush(PgRedisList *list, const char *value, Size len)
 {
-	PgRedisListNode *n = new_node(value, len);
+	PgRedisListNode *n = new_node(list->mcxt, value, len);
 
 	if (!list->ord_initialized)
 	{
@@ -139,8 +146,15 @@ detach_value(PgRedisListNode *n, Size *out_len)
 
 	if (out_len)
 		*out_len = n->value_len;
-	out = pg_redis_palloc_string(n->value, n->value_len);
-	pfree(n->value);
+	/* The popped value is returned to the SQL caller; allocate in
+	 * CurrentMemoryContext so it dies with the statement, not the long-lived
+	 * PgRedisMemoryContext. */
+	out = (char *) palloc(n->value_len + 1);
+	if (n->value_len > 0 && n->value != NULL)
+		memcpy(out, n->value, n->value_len);
+	out[n->value_len] = '\0';
+	if (n->value != NULL)
+		pfree(n->value);
 	n->value = NULL;
 	return out;
 }
@@ -156,7 +170,7 @@ record_pending_delete(PgRedisList *list, PgRedisListNode *n)
 	if (n->pending_insert)
 		return;					/* never went durable — nothing to delete */
 
-	old = MemoryContextSwitchTo(pg_redis_memcxt());
+	old = MemoryContextSwitchTo(list->mcxt);
 	o = (PgRedisOrdNode *) palloc(sizeof(PgRedisOrdNode));
 	o->ord = n->ord;
 	o->next = list->pending_delete_ords;

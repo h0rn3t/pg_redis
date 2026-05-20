@@ -8,6 +8,8 @@
 #include "storage/shmem.h"
 #include "utils/dsa.h"
 #include "utils/hsearch.h"
+#include "utils/memutils.h"
+#include "utils/resowner.h"
 
 #include "types.h"
 #include "shmem.h"
@@ -193,10 +195,23 @@ pg_redis_shmem_keyspace(void)
 dsa_area *
 pg_redis_shmem_dsa(void)
 {
+	MemoryContext old_ctx;
+	ResourceOwner old_owner;
+
 	if (cached_dsa != NULL)
 		return cached_dsa;
 	if (PgRedisShared == NULL)
 		return NULL;
+
+	/* dsa_create/dsa_attach palloc the backend-local dsa_area struct in
+	 * CurrentMemoryContext and bind it to CurrentResourceOwner. During SQL
+	 * function execution both are transient (ExecutorState / per-transaction
+	 * owner) and get torn down at end-of-statement, leaving cached_dsa
+	 * dangling on the next call. Pin the struct's lifetime to this backend by
+	 * allocating in TopMemoryContext under a NULL resource owner. */
+	old_ctx = MemoryContextSwitchTo(TopMemoryContext);
+	old_owner = CurrentResourceOwner;
+	CurrentResourceOwner = NULL;
 
 	/* Lazy create/attach: the first backend to touch DSA in shared mode
 	 * creates the segment under the startup_lock; subsequent backends just
@@ -225,6 +240,9 @@ pg_redis_shmem_dsa(void)
 	}
 	LWLockRelease(PgRedisShared->startup_lock);
 
+	CurrentResourceOwner = old_owner;
+	MemoryContextSwitchTo(old_ctx);
+
 	return cached_dsa;
 }
 
@@ -247,6 +265,29 @@ pg_redis_shmem_set_bgw_latch(Latch *latch)
 {
 	if (PgRedisShared != NULL)
 		PgRedisShared->bgw_latch = latch;
+}
+
+void
+pg_redis_shmem_acquire_all_partition_locks_exclusive(void)
+{
+	int			i;
+
+	if (PgRedisPartitionLocks == NULL || pg_redis_lock_partitions <= 0)
+		return;
+	for (i = 0; i < pg_redis_lock_partitions; i++)
+		LWLockAcquire(&PgRedisPartitionLocks[i].lock, LW_EXCLUSIVE);
+}
+
+void
+pg_redis_shmem_release_all_partition_locks(void)
+{
+	int			i;
+
+	if (PgRedisPartitionLocks == NULL || pg_redis_lock_partitions <= 0)
+		return;
+	/* Release in reverse acquisition order for hygiene. */
+	for (i = pg_redis_lock_partitions - 1; i >= 0; i--)
+		LWLockRelease(&PgRedisPartitionLocks[i].lock);
 }
 
 void

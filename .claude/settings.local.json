@@ -8,7 +8,9 @@
       "Skill(openspec-archive-change)",
       "Skill(openspec-archive-change:*)",
       "Skill(opsx:apply)",
-      "Skill(opsx:apply:*)"
+      "Skill(opsx:apply:*)",
+      "Skill(superpowers:systematic-debugging)",
+      "Skill(superpowers:systematic-debugging:*)"
     ]
   }
 }

@@ -49,4 +49,11 @@ extern int pg_redis_persistence_async_drain(int max_events);
  * transaction, calls _async_drain, commits. Returns events drained. */
 extern int pg_redis_persistence_sync_drain(void);
 
+/* Per-backend counter of dirty-ring events published in the current
+ * transaction. Bumped by mark_dirty/mark_deleted in async mode; reset by the
+ * xact callback at PRE_COMMIT / ABORT. Used to emit a WARNING on rollback
+ * (the writes have already been ack'd to the BGW and will be persisted, so
+ * the user's ROLLBACK does not undo them). */
+extern void pg_redis_persistence_note_async_publish(int n);
+
 #endif							/* PG_REDIS_PERSISTENCE_H */

@@ -78,6 +78,14 @@ extern void pg_redis_dirty_ring_publish(const PgRedisDirtyEvent *ev);
 /* Consumer (BGW) drain. Returns count copied (0 if nothing pending). */
 extern int	pg_redis_dirty_ring_drain(PgRedisDirtyEvent *out_buf, int max);
 
+/* Discard every currently-pending event without persisting it. Frees any
+ * DSA-overflow payloads so they don't leak. Returns the number of events
+ * dropped. Used by FLUSHALL in async mode (the durable rows are being
+ * TRUNCATE'd, so pending events would be redundant or worse, resurrecting
+ * deleted keys). Caller MUST hold every partition LWLock exclusively to
+ * keep producers out for the duration of the drop. */
+extern int	pg_redis_dirty_ring_drop_all_pending(void);
+
 /* Counters helpers. */
 extern uint64 pg_redis_dirty_ring_pending(void);
 extern bool pg_redis_dirty_ring_full(void);

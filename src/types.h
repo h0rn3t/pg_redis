@@ -54,8 +54,13 @@ typedef struct PgRedisList
 	int64		min_ord;
 	int64		max_ord;
 	bool		ord_initialized;
+	/* Owning context — all nodes and value buffers are palloc'd here. For the
+	 * persistent session-mode store this is PgRedisMemoryContext; for a
+	 * shared-mode scratch this is the calling SQL statement's context so the
+	 * structure dies with the statement. */
+	MemoryContext mcxt;
 	/* Ords whose live nodes have already been freed but whose durable row
-	 * still needs to be removed at flush. Allocated in PgRedisMemoryContext. */
+	 * still needs to be removed at flush. Allocated in `mcxt`. */
 	PgRedisOrdNode *pending_delete_ords;
 } PgRedisList;
 
@@ -70,6 +75,10 @@ typedef struct PgRedisHash
 	HTAB	   *fields;			/* field name -> PgRedisHashField */
 	int64		field_count;
 	Size		memory_usage;
+	/* Owning context — the HTAB, all field values, and tombstones are palloc'd
+	 * here. PgRedisMemoryContext for the persistent session-mode store; the
+	 * calling SQL statement's context for shared-mode scratches. */
+	MemoryContext mcxt;
 	/* Fields removed since last flush; their parent hash row remains. */
 	PgRedisHashTombstone *tombstones;
 } PgRedisHash;

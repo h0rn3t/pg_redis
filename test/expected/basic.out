@@ -113,6 +113,8 @@ SELECT pgredis."MEMORY_USAGE"() > 0 AS mem_positive;
 
 -- FLUSHALL clears everything
 SELECT pgredis."FLUSHALL"();
+NOTICE:  truncate cascades to table "hash_fields"
+NOTICE:  truncate cascades to table "list_items"
  FLUSHALL 
 ----------
  t

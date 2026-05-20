@@ -19,7 +19,7 @@ OBJS = \
 	src/shared_store.o
 
 DATA         = pg_redis--1.0.sql pg_redis--1.0--1.1.sql pg_redis--1.1.sql
-REGRESS      = basic ttl hashes lists persistence flush admin jobs
+REGRESS      = basic ttl hashes lists persistence flush admin jobs async_table
 REGRESS_OPTS = --inputdir=test --outputdir=test
 
 PG_CFLAGS = -Wall -Wextra -Wno-unused-parameter -Isrc
@@ -37,7 +37,7 @@ PG_VERSION   ?= 18
 DOCKER_IMAGE ?= pg_redis
 DOCKER_TAG   ?= $(PG_VERSION)
 
-.PHONY: docker-build docker-test docker-regen docker-shell docker-up docker-down docker-bench
+.PHONY: docker-build docker-test docker-test-async docker-regen docker-shell docker-up docker-down docker-bench
 
 docker-build:
 	docker build \
@@ -49,6 +49,16 @@ docker-build:
 docker-test:
 	docker build \
 		--target test \
+		--build-arg PG_VERSION=$(PG_VERSION) \
+		--progress=plain \
+		.
+
+# Async-mode tests: spins a cluster with shared_preload_libraries=pg_redis,
+# storage_mode=shared, a small dirty_ring_size, and the BGW disabled, then
+# runs test/async/*.sql. Used for scenarios pg_regress can't cover.
+docker-test-async:
+	docker build \
+		--target test-async \
 		--build-arg PG_VERSION=$(PG_VERSION) \
 		--progress=plain \
 		.

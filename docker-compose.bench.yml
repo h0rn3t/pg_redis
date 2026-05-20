@@ -35,6 +35,8 @@ services:
       - "-c"
       - "pg_redis.dirty_ring_size=65536"
       - "-c"
+      - "pg_redis.async_full_action=sync_flush"
+      - "-c"
       - "pg_redis.lock_partitions=16"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres"]

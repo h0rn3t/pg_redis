@@ -92,6 +92,13 @@ extern LWLock *pg_redis_partition_lock(const char *key, Size keylen);
 extern void pg_redis_shmem_set_bgw_latch(Latch *latch);
 extern void pg_redis_shmem_wake_bgw(void);
 
+/* Acquire / release every partition LWLock exclusively. Used by FLUSHALL in
+ * shared mode to take an exclusive snapshot of the whole keyspace while it
+ * resets state. Idempotent: when locks are not configured (session mode or
+ * shmem not initialized) this is a no-op. */
+extern void pg_redis_shmem_acquire_all_partition_locks_exclusive(void);
+extern void pg_redis_shmem_release_all_partition_locks(void);
+
 /* DSA wrappers — allocate / free a chunk in the shared DSA segment. Returns
  * InvalidDsaPointer (0) on allocation failure (caller raises
  * ERRCODE_OUT_OF_MEMORY). NULL-safe on shared_dsa_pfree. */

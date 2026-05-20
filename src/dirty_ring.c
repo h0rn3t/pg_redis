@@ -101,8 +101,10 @@ pg_redis_dirty_ring_full(void)
  */
 /* Forward decl — defined in src/persistence.c. Called by publish() when the
  * ring is full and async_full_action='sync_flush'. The producer drains
- * synchronously in its own transaction so commits become slower instead of
- * failing. NULL-safe: returns 0 if persistence layer can't drain. */
+ * synchronously inside an internal subtransaction of the user's xact (or a
+ * top-level transaction when no outer xact is active), so commits become
+ * slower instead of failing. NULL-safe: returns 0 if persistence layer
+ * can't drain. */
 extern int pg_redis_persistence_sync_drain(void);
 
 void
@@ -230,6 +232,47 @@ pg_redis_dirty_ring_drain(PgRedisDirtyEvent *out_buf, int max)
 		pg_atomic_write_u64(&h->ring_read_head, r);
 
 	return drained;
+}
+
+int
+pg_redis_dirty_ring_drop_all_pending(void)
+{
+	PgRedisSharedHeader *h = pg_redis_shmem_header();
+	uint64		w,
+				r;
+	int			dropped = 0;
+
+	if (h == NULL || ring_slots == NULL || ring_capacity <= 0)
+		return 0;
+
+	w = pg_atomic_read_u64(&h->ring_write_head);
+	r = pg_atomic_read_u64(&h->ring_read_head);
+
+	while (r < w)
+	{
+		PgRedisDirtyEvent *slot = &ring_slots[r % ring_capacity];
+		uint32		expected = SLOT_READY;
+
+		if (!pg_atomic_compare_exchange_u32(&slot->state, &expected, SLOT_DRAINING))
+		{
+			/* Producer mid-fill — caller is supposed to hold all partition
+			 * locks so this shouldn't happen, but be defensive. Bail. */
+			break;
+		}
+
+		pg_read_barrier();
+		if (slot->dsa_overflow && slot->dsa_payload != InvalidDsaPointer)
+			pg_redis_shared_pfree(slot->dsa_payload);
+
+		pg_atomic_write_u32(&slot->state, SLOT_EMPTY);
+		r++;
+		dropped++;
+	}
+
+	if (dropped > 0)
+		pg_atomic_write_u64(&h->ring_read_head, r);
+
+	return dropped;
 }
 
 /* -------------------------------------------------------------------------

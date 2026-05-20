@@ -269,7 +269,9 @@ pg_redis_shared_list_materialize(const PgRedisSharedListMeta *meta)
 	if (meta == NULL || meta->head == InvalidDsaPointer)
 		return NULL;
 
-	l = pg_redis_list_create();
+	/* Scratch list dies with the statement — see the matching note in
+	 * pg_redis_shared_hash_materialize. */
+	l = pg_redis_list_create_in(CurrentMemoryContext);
 
 	cur = meta->head;
 	while (cur != InvalidDsaPointer)

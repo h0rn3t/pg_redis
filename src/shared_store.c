@@ -48,13 +48,15 @@ materialize_scratch(const PgRedisSharedEntry *se)
 				Size		n;
 
 				n = se->value.scalar.value_len;
-				elog(LOG, "pg_redis: materialize STRING n=%zu dsa_value=%lu",
-					 (size_t) n, (unsigned long) se->value.scalar.dsa_value);
 				src = (const char *) pg_redis_shared_addr(se->value.scalar.dsa_value);
-				elog(LOG, "pg_redis: materialize STRING shared_addr returned src=%p", (void *) src);
 				if (src != NULL && n > 0)
 				{
-					e->value.string_value = pg_redis_palloc_string(src, n);
+					/* CurrentMemoryContext: scratch dies with the statement. */
+					char	   *dst = (char *) palloc(n + 1);
+
+					memcpy(dst, src, n);
+					dst[n] = '\0';
+					e->value.string_value = dst;
 					e->string_len = n;
 				}
 				else
@@ -242,25 +244,13 @@ pg_redis_shared_store_lookup_raw(const char *key)
 	PgRedisSharedEntry *se;
 	PgRedisEntry *scratch = NULL;
 
-	elog(LOG, "pg_redis: shared_lookup_raw key=\"%s\" ks=%p plock=%p",
-		 key ? key : "(null)", (void *) ks, (void *) plock);
-
 	if (ks == NULL || plock == NULL)
 		return NULL;
 
 	LWLockAcquire(plock, LW_SHARED);
 	se = (PgRedisSharedEntry *) hash_search(ks, key, HASH_FIND, &found);
-	elog(LOG, "pg_redis: shared_lookup_raw hash_search returned se=%p found=%d",
-		 (void *) se, (int) found);
 	if (found)
-	{
-		elog(LOG, "pg_redis: materialize_scratch se->type=%d se->value.scalar.dsa_value=%lu se->value.scalar.value_len=%zu",
-			 (int) se->type,
-			 (unsigned long) se->value.scalar.dsa_value,
-			 (size_t) se->value.scalar.value_len);
 		scratch = materialize_scratch(se);
-		elog(LOG, "pg_redis: materialize_scratch returned scratch=%p", (void *) scratch);
-	}
 	LWLockRelease(plock);
 
 	return scratch;
@@ -343,6 +333,50 @@ pg_redis_shared_store_upsert(const char *key, bool *is_new)
 	return scratch;
 }
 
+int
+pg_redis_shared_store_reset_all(void)
+{
+	HTAB	   *ks = pg_redis_shmem_keyspace();
+	HASH_SEQ_STATUS s;
+	PgRedisSharedEntry *se;
+	int			removed = 0;
+	char	  **keys_to_remove;
+	int			capacity = 64;
+	int			n = 0;
+	int			i;
+	bool		found;
+
+	if (ks == NULL)
+		return 0;
+
+	/* Two-pass: collect keys first, then remove. hash_seq_search + HASH_REMOVE
+	 * in the same loop is not safe per hsearch.h. */
+	keys_to_remove = (char **) palloc(sizeof(char *) * capacity);
+	hash_seq_init(&s, ks);
+	while ((se = (PgRedisSharedEntry *) hash_seq_search(&s)) != NULL)
+	{
+		if (n == capacity)
+		{
+			capacity *= 2;
+			keys_to_remove = (char **) repalloc(keys_to_remove,
+												sizeof(char *) * capacity);
+		}
+		keys_to_remove[n++] = pstrdup(se->key);
+		pg_redis_shared_entry_release_payloads(se);
+	}
+
+	for (i = 0; i < n; i++)
+	{
+		hash_search(ks, keys_to_remove[i], HASH_REMOVE, &found);
+		if (found)
+			removed++;
+		pfree(keys_to_remove[i]);
+	}
+	pfree(keys_to_remove);
+
+	return removed;
+}
+
 bool
 pg_redis_shared_store_remove(const char *key)
 {
@@ -366,6 +400,51 @@ pg_redis_shared_store_remove(const char *key)
 	return found;
 }
 
+/* Apply only dirty fields and tombstones from `h` to the shared entry's
+ * existing DSA chain — avoids the O(N) release+rebuild that would otherwise
+ * fire on every HSET/HDEL of a multi-field hash. The scratch's clean fields
+ * are left exactly as they sit in DSA. */
+static void
+surgical_apply_hash(PgRedisSharedEntry *se, PgRedisHash *h)
+{
+	HASH_SEQ_STATUS s;
+	PgRedisHashField *f;
+	PgRedisHashTombstone *t;
+	dsa_pointer head = se->value.hash.fields_head;
+	int64		count = se->value.hash.field_count;
+
+	if (h != NULL && h->fields != NULL)
+	{
+		hash_seq_init(&s, h->fields);
+		while ((f = (PgRedisHashField *) hash_seq_search(&s)) != NULL)
+		{
+			bool		was_new;
+
+			if (!f->dirty)
+				continue;
+			pg_redis_shared_hash_set(&head,
+									 f->field, strlen(f->field),
+									 (const unsigned char *) f->value,
+									 f->value_len,
+									 &was_new);
+			if (was_new)
+				count++;
+		}
+	}
+
+	if (h != NULL)
+	{
+		for (t = h->tombstones; t != NULL; t = t->next)
+		{
+			if (pg_redis_shared_hash_del(&head, t->field, strlen(t->field)))
+				count--;
+		}
+	}
+
+	se->value.hash.fields_head = head;
+	se->value.hash.field_count = count;
+}
+
 void
 pg_redis_shared_store_writeback(PgRedisEntry *scratch)
 {
@@ -376,8 +455,6 @@ pg_redis_shared_store_writeback(PgRedisEntry *scratch)
 
 	if (scratch == NULL)
 		return;
-	elog(LOG, "pg_redis: writeback key=\"%s\" type=%d string_len=%zu",
-		 scratch->key, (int) scratch->type, (size_t) scratch->string_len);
 	ks = pg_redis_shmem_keyspace();
 	plock = pg_redis_partition_lock(scratch->key, strlen(scratch->key));
 	if (ks == NULL || plock == NULL)
@@ -385,6 +462,11 @@ pg_redis_shared_store_writeback(PgRedisEntry *scratch)
 
 	LWLockAcquire(plock, LW_EXCLUSIVE);
 	se = (PgRedisSharedEntry *) hash_search(ks, scratch->key, HASH_ENTER, &found);
+
+	/* Decide between surgical (cheap, type matches) and full rebuild. The
+	 * surgical path is only safe when an existing entry of the same type is
+	 * being mutated — type changes (SET on a key that previously held a
+	 * hash) still need release+rebuild so we drop the stale DSA chunks. */
 	if (!found)
 	{
 		MemSet(&se->value, 0, sizeof(se->value));
@@ -392,15 +474,32 @@ pg_redis_shared_store_writeback(PgRedisEntry *scratch)
 		se->value.hash.fields_head = InvalidDsaPointer;
 		se->value.list.head = InvalidDsaPointer;
 		se->value.list.tail = InvalidDsaPointer;
+		populate_shared_from_scratch(se, scratch);
+	}
+	else if (se->type != scratch->type)
+	{
+		pg_redis_shared_entry_release_payloads(se);
+		populate_shared_from_scratch(se, scratch);
+	}
+	else if (scratch->type == PG_REDIS_TYPE_HASH)
+	{
+		/* In-place surgical update — see surgical_apply_hash. */
+		se->expire_at = scratch->expire_at;
+		se->has_expire = scratch->has_expire;
+		se->version = scratch->version;
+		surgical_apply_hash(se, scratch->value.hash_value);
+		LWLockRelease(plock);
+		return;
 	}
 	else
 	{
-		/* Free old payloads before installing new ones. If the type changed
-		 * (e.g. SET on a key previously holding a hash) the old DSA chunks
-		 * need to go regardless. */
+		/* STRING/INT/LIST: the cheap path isn't implemented yet, fall back
+		 * to release+rebuild. Strings/ints are single-payload so the cost is
+		 * O(1); lists are O(N) but mutations are rarer than the hash hot
+		 * path that triggers production OOMs. */
 		pg_redis_shared_entry_release_payloads(se);
+		populate_shared_from_scratch(se, scratch);
 	}
 
-	populate_shared_from_scratch(se, scratch);
 	LWLockRelease(plock);
 }

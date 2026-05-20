@@ -1,0 +1,38 @@
+-- async_table mode: misconfiguration warning + fallback semantics.
+--
+-- This test runs in a normal pg_regress backend (no shared_preload_libraries,
+-- storage_mode defaults to 'session'). Setting persistence_mode='async_table'
+-- in that configuration must:
+--   1. Emit a WARNING at GUC assignment (the assign_persistence_mode hook).
+--   2. Cause runtime to fall back to sync_table semantics — i.e. mutations
+--      still produce durable rows in pgredis.store at COMMIT time, exactly
+--      like sync_table mode.
+--
+-- True async behavior (BGW drain, dirty-ring, cross-backend visibility) needs
+-- shared_preload_libraries='pg_redis' + storage_mode='shared'. Those scenarios
+-- (10.1, 10.2, 10.3, 10.4, 10.5, 10.6) live in the docker-bench harness, not
+-- pg_regress (which is single-connection and does not set up shared memory).
+CREATE EXTENSION pg_redis;
+
+-- 10.7: setting async_table without storage_mode='shared' MUST warn and fall
+-- back to sync_table. The WARNING fires at SET time via assign_persistence_mode.
+SET pg_redis.persistence_mode = 'async_table';
+
+-- Mutation still produces a durable row at COMMIT (sync_table fallback).
+SELECT pgredis."SET"('a:1', 'v');
+SELECT count(*) FROM pgredis.store WHERE key = 'a:1';      -- 1
+
+-- ROLLBACK still undoes the durable write (sync_table semantics: the dirty
+-- list is dropped at XACT_EVENT_ABORT, never reaches SPI).
+BEGIN;
+SELECT pgredis."SET"('a:rb', 'tmp');
+ROLLBACK;
+SELECT count(*) FROM pgredis.store WHERE key = 'a:rb';     -- 0
+
+-- And restoring sync_table shows no further WARNINGs (the hook only fires
+-- when the new value is async_table).
+SET pg_redis.persistence_mode = 'sync_table';
+SELECT pgredis."SET"('a:2', 'v');
+SELECT count(*) FROM pgredis.store WHERE key = 'a:2';      -- 1
+
+DROP EXTENSION pg_redis CASCADE;

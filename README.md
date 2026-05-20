@@ -484,33 +484,49 @@ SELECT * FROM pgredis."JOB_STATS"();
 
 | GUC | Type | Default | Effect |
 | --- | --- | --- | --- |
-| `pg_redis.persistence_mode` | string | `sync_table` | `none`, `sync_table`, `async_table`, `snapshot`, or `aof`. `async_table` and `aof` fall back to `sync_table` in v0.1. |
-| `pg_redis.storage_mode` | string | `session` | `session` (per-backend in-memory) or `shared`. v0.1 implements `session` only. |
-| `pg_redis.flush_interval` | int seconds | `5` | Background worker tick interval. |
+| `pg_redis.persistence_mode` | string | `sync_table` | `none`, `sync_table`, `async_table`, `snapshot`, or `aof`. `aof` falls back to `sync_table`. `async_table` is functional when paired with `storage_mode=shared`; otherwise it downgrades to `sync_table` with a `WARNING`. |
+| `pg_redis.storage_mode` | string | `session` | `session` (per-backend HTAB) or `shared` (cluster-wide HTAB visible to every backend). `shared` requires `shared_preload_libraries='pg_redis'`. |
+| `pg_redis.flush_interval` | int seconds | `5` | Background worker tick interval. In `async_table` mode, also the upper bound on the durability window for acknowledged writes. |
 | `pg_redis.flush_batch_size` | int | `1000` | Max dirty entries flushed per tick (reserved). |
 | `pg_redis.ttl_cleanup_interval` | int seconds | `30` | Default TTL sweep cadence for the `ttl_cleanup` job. |
 | `pg_redis.max_key_size` | int bytes | `1024` | Reject keys longer than this. |
 | `pg_redis.max_value_size` | int bytes | `1048576` | Reject values longer than this. |
 | `pg_redis.enable_background_worker` | bool | `off` | Enable the worker (requires `shared_preload_libraries`). |
+| `pg_redis.shared_max_memory` | int MB | `256` | Cap on the DSA segment backing variable-size payloads in `storage_mode=shared`. Postmaster-only. |
+| `pg_redis.dirty_ring_size` | int slots | `65536` | Slots in the shared dirty-ring used by `async_table`. Postmaster-only. |
+| `pg_redis.lock_partitions` | int | `16` | Number of partitioned LWLocks guarding the shared HTAB. Postmaster-only. |
+| `pg_redis.async_full_action` | enum | `block` | What a producer does when the dirty-ring is full: `block` (spin briefly then `ERROR`) or `sync_flush` (drain inline in the producer's xact then retry). |
 
 Invalid persistence/storage values are rejected at `SET` time via a GUC
 `check_hook`.
 
 ## Storage modes
 
-### `session` (v0.1 default and only mode)
+### `session` (default)
 
 Each backend has its own `MemoryContext` and `dynahash` HTAB. Writes go to
 your in-memory copy and — in `sync_table` mode — to `pgredis.store` in the
 calling transaction. Other backends see your writes by reading the durable
-row.
+row on their next lazy-load.
 
-### `shared` (reserved)
+### `shared`
 
-A future release will host the keyspace in PostgreSQL shared memory behind an
-LWLock so every backend sees the same state. Until then, treat `shared` as
-a no-op; the GUC is accepted but the runtime stays in `session` mode and
-emits a `WARNING` at startup if you set it.
+The keyspace lives in PostgreSQL shared memory (`ShmemInitHash` with
+`HASH_PARTITION`) and is visible to every backend. Variable-size payloads
+(strings, hash field maps, list element chains) live in a single DSA segment
+sized by `pg_redis.shared_max_memory`. Access is serialized by
+`pg_redis.lock_partitions` partitioned `LWLock`s (reads take `LW_SHARED`,
+writes take `LW_EXCLUSIVE`).
+
+Requires `shared_preload_libraries='pg_redis'` so the postmaster can reserve
+shared memory at startup. The keyspace is loaded once per postmaster lifetime
+from `pgredis.store` / `pgredis.hash_fields` / `pgredis.list_items` by the
+first backend to touch it (gated by an atomic loaded flag in the shared
+header).
+
+Cross-backend visibility: after backend A's `SET k v` returns, backend B's
+next `GET k` returns `v` directly from shared memory — no detour through the
+durable table.
 
 ## Persistence modes
 
@@ -518,15 +534,95 @@ emits a `WARNING` at startup if you set it.
 | --- | --- | --- | --- |
 | `none` | memory only; dirty-set tracking still runs but pre-commit flush is a no-op | no | no (session-local) |
 | `sync_table` (default) | memory + queued in per-backend dirty-set; flushed in one batched SPI session at `XACT_EVENT_PRE_COMMIT` | yes (rolls back with the user xact) | yes (after their first command lazy-loads) |
-| `async_table` | falls back to `sync_table` in v0.1 | yes | yes |
+| `async_table` | memory writeback to shared HTAB + `PgRedisDirtyEvent` published to the shared dirty-ring; command returns before durability. The BGW drains the ring into durable tables in its own transaction at most every `flush_interval`. Requires `storage_mode=shared`. | yes, with bounded crash window | yes, immediately (shared HTAB is authoritative) |
 | `snapshot` | use `SAVE`/`BGSAVE` to emit point-in-time rows in `pgredis.snapshots` | by snapshot | snapshots are global |
 | `aof` | scaffolded only; `BGREWRITEAOF` returns false | no | n/a |
 
-**Crash window in async mode (future):** in true `async_table`, mutating
-commands are acked before the dirty queue is flushed. A postmaster crash or
-hardware fault between the ack and the next flush will lose the most recent
-dirty writes. Operators picking `async_table` for throughput must accept that
-window. v0.1 sidesteps this by always doing the synchronous write.
+**Crash window in `async_table`:** mutating commands are acknowledged to the
+caller before the BGW drains. A postmaster crash or hardware fault before
+the next drain loses any event still in the ring. Worst-case loss is
+bounded by `pg_redis.flush_interval` seconds of acked writes. The user's
+transaction `ROLLBACK` does **not** undo an `async_table` mutation — the
+shared HTAB is authoritative and the durable row will land regardless. A
+`WARNING` is emitted on `XACT_EVENT_ABORT` listing the number of events
+already published.
+
+**Misconfiguration**: setting `persistence_mode='async_table'` with
+`storage_mode='session'` is a configuration error. The runtime emits a
+`WARNING` at GUC assignment and silently downgrades to `sync_table`
+behavior until `storage_mode` is corrected.
+
+### Configuration for `async_table`
+
+Minimum viable `postgresql.conf` for the async path:
+
+```conf
+shared_preload_libraries = 'pg_redis'
+pg_redis.storage_mode = 'shared'
+pg_redis.persistence_mode = 'async_table'
+pg_redis.enable_background_worker = on
+pg_redis.shared_max_memory = 256MB
+pg_redis.dirty_ring_size = 65536
+pg_redis.lock_partitions = 16
+pg_redis.async_full_action = 'block'
+pg_redis.flush_interval = 5
+```
+
+Cache workload (loss-tolerant, latency-sensitive):
+
+```conf
+pg_redis.flush_interval = 10        # larger crash window; less BGW work
+pg_redis.async_full_action = 'block'
+```
+
+Session-store workload (loss-averse, throughput-sensitive):
+
+```conf
+pg_redis.flush_interval = 1         # tighter crash window
+pg_redis.async_full_action = 'sync_flush'   # never error a write
+synchronous_commit = on             # default
+```
+
+Pure-cache "fastest" workload:
+
+```conf
+synchronous_commit = off            # drop WAL fsync from the BGW's drain
+pg_redis.flush_interval = 30
+```
+
+### Tuning
+
+**Sizing `dirty_ring_size`** — pick `peak_write_rate × flush_interval × 2`
+as a starting point. Example: 10k writes/sec sustained × 5s flush_interval
+× 2 (safety) → 100k slots. Default 65536 covers ~6.5k writes/sec sustained
+at the default 5s flush_interval, which matches the single-client throughput
+floor measured on the bench harness.
+
+**Picking `async_full_action`** —
+
+- `block` (default): a producer that hits a full ring spins 100×100µs (~10ms
+  total) and then raises `ERRCODE_INSUFFICIENT_RESOURCES`. The user's
+  transaction aborts. Use when you'd rather surface backpressure as visible
+  errors than silently slow things down.
+- `sync_flush`: a producer that hits a full ring drains a batch inline,
+  then retries the slot claim. Commands never fail from ring fullness;
+  instead the producer takes the latency hit of a synchronous SPI session
+  that batch. The inline drain runs inside an internal subtransaction of
+  the user's transaction (so a drain failure is scoped to itself and does
+  not abort the surrounding command); from contexts with no active
+  transaction it falls back to a top-level transaction. Use when uniform
+  tail latency matters less than zero spurious failures.
+
+**Sizing `lock_partitions`** — defaults to 16, matching common multi-socket
+machines. Bump up only if you see write contention metrics dominated by
+LWLock waits on partition locks; the lock array itself is cheap, but more
+partitions mean more cache traffic on cross-key workloads.
+
+**Sizing `shared_max_memory`** — bound by the working-set size of your
+keyspace, not the number of keys. The fixed-size `PgRedisSharedEntry` lives
+in the HTAB header (no DSA cost); only variable payloads (string values,
+hash field maps, list element chains) consume DSA. Default 256MB suits a
+working set of ~100k average-size entries.
 
 ## Background workers
 
@@ -539,19 +635,25 @@ pg_redis.enable_background_worker = on
 ```
 
 …and restart PostgreSQL, the extension registers a single background worker
-("pg_redis bgworker") that connects to the `postgres` database, ticks every
-`pg_redis.flush_interval` seconds, and runs any job in `pgredis.jobs` whose
-`enabled` is true and `next_run <= now()`. The worker also handles `SIGTERM`
-(clean shutdown) and `SIGHUP` (config reload).
+("pg_redis bgworker") that connects to the `postgres` database. Each tick
+does two things:
+
+1. **Job scheduler**: runs any job in `pgredis.jobs` whose `enabled` is true
+   and `next_run <= now()`.
+2. **Dirty-ring drain** (only when `persistence_mode=async_table`): if
+   pending events ≥ `dirty_ring_size / 4` OR the time since the last drain
+   ≥ `flush_interval`, the worker opens a transaction, drains the ring into
+   the durable tables using the same batched-array SPI plans as
+   `sync_table`'s pre-commit flush, and commits.
+
+Producers wake the worker eagerly by `SetLatch`'ing its latch when the ring
+crosses the watermark or fills up. The worker handles `SIGTERM` (clean
+shutdown — performs one final drain if any events remain) and `SIGHUP`
+(config reload).
 
 You can always run jobs inline from a regular backend via
 `SELECT pgredis."RUN_JOB"(<id>)` — useful for testing without changing
 `shared_preload_libraries`.
-
-**Important**: because the keyspace is session-local in v0.1, the
-`flush_dirty_keys` job inside the worker can only see the worker's own
-backend (which is empty). It logs a `DEBUG1` line saying so. Once shared
-storage lands, the same job will flush across the cluster.
 
 ## Transaction limitations
 
@@ -583,12 +685,33 @@ itself or for any of the SQL commands.
 
 ## Roadmap
 
-- `shared` storage mode with a DSA-backed keyspace and `dshash`.
-- Real `async_table` with a shared dirty queue and batched flush.
 - Append-only file replay (`BGREWRITEAOF`, AOF replay on first use).
 - Transaction-aware in-memory rollback (cooperative subtransaction tracking).
 - `SUBSCRIBE`/`PUBLISH`, sorted sets, streams — long term.
 - Per-database / per-namespace separation.
+
+## Release notes
+
+### v1.2 — `async_table` + `storage_mode=shared` (no on-disk change)
+
+- `pg_redis.storage_mode='shared'` is now functional. The keyspace lives in
+  shared memory (`ShmemInitHash` with `HASH_PARTITION`) backed by a DSA
+  segment for variable-size payloads. Cross-backend visibility is immediate
+  — no detour through the durable table.
+- `pg_redis.persistence_mode='async_table'` is now functional. Mutating
+  commands publish a `PgRedisDirtyEvent` into a multi-producer / single-
+  consumer shared dirty-ring; the BGW drains it into durable tables in its
+  own transaction at most every `flush_interval`. Single-client autocommit
+  SET expected to improve ~3× over `sync_table` once the path is benched.
+- Four new GUCs: `pg_redis.shared_max_memory`, `pg_redis.dirty_ring_size`,
+  `pg_redis.lock_partitions`, `pg_redis.async_full_action`.
+- Misconfiguration (`async_table` + `session`) emits a `WARNING` at GUC
+  assignment and runtime falls back to `sync_table`.
+- `ROLLBACK` of a transaction containing `async_table` mutations emits a
+  `WARNING` listing the number of already-acked events that will NOT be
+  undone — `async_table` is durable independently of the user's xact.
+- No on-disk schema change; v1.1 schema is sufficient. Operators opt in
+  via GUCs plus `shared_preload_libraries='pg_redis'`.
 
 ## Test layout
 

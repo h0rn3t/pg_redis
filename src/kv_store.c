@@ -16,6 +16,7 @@
 #include "binval.h"
 #include "dirty_ring.h"
 #include "shared_store.h"
+#include "persistence.h"
 
 static HTAB *PgRedisStore = NULL;
 
@@ -391,6 +392,7 @@ publish_async_key_upsert(PgRedisEntry *e)
 		body_len = VARSIZE(tlv) - VARHDRSZ;
 		pg_redis_event_encode_key_upsert(&ev, e, body, body_len);
 		pg_redis_dirty_ring_publish(&ev);
+		pg_redis_persistence_note_async_publish(1);
 		pfree(tlv);
 	}
 	else
@@ -398,6 +400,7 @@ publish_async_key_upsert(PgRedisEntry *e)
 		/* hash/list parent row: NULL value */
 		pg_redis_event_encode_key_upsert(&ev, e, NULL, 0);
 		pg_redis_dirty_ring_publish(&ev);
+		pg_redis_persistence_note_async_publish(1);
 	}
 }
 
@@ -426,6 +429,7 @@ publish_async_hash_deltas(PgRedisEntry *e)
 												(const unsigned char *) f->value,
 												f->value_len);
 		pg_redis_dirty_ring_publish(&ev);
+		pg_redis_persistence_note_async_publish(1);
 		f->dirty = false;
 	}
 
@@ -436,6 +440,7 @@ publish_async_hash_deltas(PgRedisEntry *e)
 												e->key, keylen,
 												t->field, strlen(t->field));
 		pg_redis_dirty_ring_publish(&ev);
+		pg_redis_persistence_note_async_publish(1);
 		pfree(t->field);
 		pfree(t);
 	}
@@ -465,6 +470,7 @@ publish_async_list_deltas(PgRedisEntry *e)
 											   (const unsigned char *) n->value,
 											   n->value_len);
 		pg_redis_dirty_ring_publish(&ev);
+		pg_redis_persistence_note_async_publish(1);
 		n->pending_insert = false;
 	}
 
@@ -475,6 +481,7 @@ publish_async_list_deltas(PgRedisEntry *e)
 											   e->key, keylen,
 											   o->ord);
 		pg_redis_dirty_ring_publish(&ev);
+		pg_redis_persistence_note_async_publish(1);
 		pfree(o);
 	}
 	l->pending_delete_ords = NULL;
@@ -537,6 +544,7 @@ pg_redis_mark_deleted(const char *key)
 
 		pg_redis_event_encode_key_delete(&ev, key, strlen(key));
 		pg_redis_dirty_ring_publish(&ev);
+		pg_redis_persistence_note_async_publish(1);
 		return;
 	}
 

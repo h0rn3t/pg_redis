@@ -15,11 +15,12 @@ static dsa_pointer
 new_field_node(const char *field, Size fieldlen,
 			   const unsigned char *value, Size value_len)
 {
-	dsa_pointer node_p = pg_redis_shared_palloc(sizeof(PgRedisSharedHashField));
+	dsa_pointer node_p;
 	PgRedisSharedHashField *node;
 	dsa_pointer field_p,
 				value_p;
 
+	node_p = pg_redis_shared_palloc(sizeof(PgRedisSharedHashField));
 	if (node_p == InvalidDsaPointer)
 		return InvalidDsaPointer;
 
@@ -261,7 +262,12 @@ pg_redis_shared_hash_materialize(dsa_pointer head)
 	if (head == InvalidDsaPointer)
 		return NULL;
 
-	h = pg_redis_hash_create();
+	/* Allocate the scratch hash in CurrentMemoryContext so it dies with the
+	 * SQL statement. Allocating in PgRedisMemoryContext (the long-lived
+	 * session-store context) would leak the hash on every shared-mode lookup,
+	 * which compounds into hundreds of MB after a few thousand HSET/HDEL on a
+	 * single key. */
+	h = pg_redis_hash_create_in(CurrentMemoryContext);
 
 	while (cur != InvalidDsaPointer)
 	{

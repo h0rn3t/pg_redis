@@ -17,13 +17,19 @@ RUN make clean >/dev/null 2>&1 || true \
  && make \
  && make install
 COPY scripts/docker-test.sh /usr/local/bin/docker-test.sh
-RUN chmod +x /usr/local/bin/docker-test.sh \
+COPY scripts/docker-test-async.sh /usr/local/bin/docker-test-async.sh
+RUN chmod +x /usr/local/bin/docker-test.sh /usr/local/bin/docker-test-async.sh \
  && chown -R postgres:postgres /build
 
 FROM builder AS test
 USER postgres
 ENV PGDATA=/tmp/pgdata
 RUN /usr/local/bin/docker-test.sh
+
+FROM builder AS test-async
+USER postgres
+ENV PGDATA=/tmp/pgdata-async
+RUN /usr/local/bin/docker-test-async.sh
 
 FROM postgres:${PG_VERSION}-bookworm AS runtime
 ARG PG_VERSION
