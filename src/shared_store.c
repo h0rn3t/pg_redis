@@ -17,6 +17,8 @@
 #include "shared_hash.h"
 #include "shared_list.h"
 #include "shared_store.h"
+#include "dirty_ring.h"
+#include "persistence.h"
 #include "utils.h"
 
 /* -------------------------------------------------------------------------
@@ -71,7 +73,7 @@ materialize_scratch(const PgRedisSharedEntry *se)
 			break;
 		case PG_REDIS_TYPE_HASH:
 			e->value.hash_value =
-				pg_redis_shared_hash_materialize(se->value.hash.fields_head);
+				pg_redis_shared_hash_materialize(se->value.hash.table);
 			break;
 		case PG_REDIS_TYPE_LIST:
 			{
@@ -112,8 +114,8 @@ pg_redis_shared_entry_release_payloads(PgRedisSharedEntry *se)
 			se->value.scalar.int_value = 0;
 			break;
 		case PG_REDIS_TYPE_HASH:
-			pg_redis_shared_hash_free(se->value.hash.fields_head);
-			se->value.hash.fields_head = InvalidDsaPointer;
+			pg_redis_shared_hash_free(se->value.hash.table);
+			se->value.hash.table = InvalidDsaPointer;
 			se->value.hash.field_count = 0;
 			break;
 		case PG_REDIS_TYPE_LIST:
@@ -175,7 +177,7 @@ populate_shared_from_scratch(PgRedisSharedEntry *se, const PgRedisEntry *e)
 		case PG_REDIS_TYPE_HASH:
 			{
 				PgRedisHash *h = e->value.hash_value;
-				dsa_pointer head = InvalidDsaPointer;
+				dsa_pointer table_dsa = InvalidDsaPointer;
 				HASH_SEQ_STATUS s;
 				PgRedisHashField *f;
 				int64		count = 0;
@@ -187,7 +189,7 @@ populate_shared_from_scratch(PgRedisSharedEntry *se, const PgRedisEntry *e)
 					{
 						bool		was_new;
 
-						pg_redis_shared_hash_set(&head,
+						pg_redis_shared_hash_set(&table_dsa,
 												 f->field, strlen(f->field),
 												 (const unsigned char *) f->value,
 												 f->value_len,
@@ -196,7 +198,7 @@ populate_shared_from_scratch(PgRedisSharedEntry *se, const PgRedisEntry *e)
 							count++;
 					}
 				}
-				se->value.hash.fields_head = head;
+				se->value.hash.table = table_dsa;
 				se->value.hash.field_count = count;
 				break;
 			}
@@ -256,6 +258,60 @@ pg_redis_shared_store_lookup_raw(const char *key)
 	return scratch;
 }
 
+PgRedisFastHashOutcome
+pg_redis_shared_hash_lookup_field(const char *key, Size keylen,
+								  const char *field, Size fieldlen,
+								  bool want_value,
+								  unsigned char **out_value, Size *out_value_len,
+								  PgRedisValueType *out_actual)
+{
+	HTAB	   *ks = pg_redis_shmem_keyspace();
+	LWLock	   *plock = pg_redis_partition_lock(key, keylen);
+	bool		found;
+	PgRedisSharedEntry *se;
+	PgRedisFastHashOutcome outcome;
+	dsa_pointer table_dsa = InvalidDsaPointer;
+	bool		field_hit = false;
+
+	if (out_value)
+		*out_value = NULL;
+	if (out_value_len)
+		*out_value_len = 0;
+
+	if (ks == NULL || plock == NULL)
+		return PG_REDIS_FAST_HASH_KEY_MISS;
+
+	LWLockAcquire(plock, LW_SHARED);
+	se = (PgRedisSharedEntry *) hash_search(ks, key, HASH_FIND, &found);
+	if (!found)
+	{
+		LWLockRelease(plock);
+		return PG_REDIS_FAST_HASH_KEY_MISS;
+	}
+	if (se->has_expire && GetCurrentTimestamp() >= se->expire_at)
+	{
+		LWLockRelease(plock);
+		return PG_REDIS_FAST_HASH_KEY_EXPIRED;
+	}
+	if (se->type != PG_REDIS_TYPE_HASH)
+	{
+		if (out_actual)
+			*out_actual = se->type;
+		LWLockRelease(plock);
+		return PG_REDIS_FAST_HASH_WRONGTYPE;
+	}
+
+	table_dsa = se->value.hash.table;
+	if (want_value)
+		field_hit = pg_redis_shared_hash_get(table_dsa, field, fieldlen,
+											 out_value, out_value_len);
+	else
+		field_hit = pg_redis_shared_hash_exists(table_dsa, field, fieldlen);
+	outcome = field_hit ? PG_REDIS_FAST_HASH_HIT : PG_REDIS_FAST_HASH_FIELD_MISS;
+	LWLockRelease(plock);
+	return outcome;
+}
+
 PgRedisEntry *
 pg_redis_shared_store_lookup(const char *key, bool *expired)
 {
@@ -307,7 +363,7 @@ pg_redis_shared_store_upsert(const char *key, bool *is_new)
 		se->has_expire = false;
 		se->version = 1;
 		se->value.scalar.dsa_value = InvalidDsaPointer;
-		se->value.hash.fields_head = InvalidDsaPointer;
+		se->value.hash.table = InvalidDsaPointer;
 		se->value.list.head = InvalidDsaPointer;
 		se->value.list.tail = InvalidDsaPointer;
 		se->value.list.min_ord = 0;
@@ -410,7 +466,7 @@ surgical_apply_hash(PgRedisSharedEntry *se, PgRedisHash *h)
 	HASH_SEQ_STATUS s;
 	PgRedisHashField *f;
 	PgRedisHashTombstone *t;
-	dsa_pointer head = se->value.hash.fields_head;
+	dsa_pointer table_dsa = se->value.hash.table;
 	int64		count = se->value.hash.field_count;
 
 	if (h != NULL && h->fields != NULL)
@@ -422,7 +478,7 @@ surgical_apply_hash(PgRedisSharedEntry *se, PgRedisHash *h)
 
 			if (!f->dirty)
 				continue;
-			pg_redis_shared_hash_set(&head,
+			pg_redis_shared_hash_set(&table_dsa,
 									 f->field, strlen(f->field),
 									 (const unsigned char *) f->value,
 									 f->value_len,
@@ -436,12 +492,12 @@ surgical_apply_hash(PgRedisSharedEntry *se, PgRedisHash *h)
 	{
 		for (t = h->tombstones; t != NULL; t = t->next)
 		{
-			if (pg_redis_shared_hash_del(&head, t->field, strlen(t->field)))
+			if (pg_redis_shared_hash_del(&table_dsa, t->field, strlen(t->field)))
 				count--;
 		}
 	}
 
-	se->value.hash.fields_head = head;
+	se->value.hash.table = table_dsa;
 	se->value.hash.field_count = count;
 }
 
@@ -471,7 +527,7 @@ pg_redis_shared_store_writeback(PgRedisEntry *scratch)
 	{
 		MemSet(&se->value, 0, sizeof(se->value));
 		se->value.scalar.dsa_value = InvalidDsaPointer;
-		se->value.hash.fields_head = InvalidDsaPointer;
+		se->value.hash.table = InvalidDsaPointer;
 		se->value.list.head = InvalidDsaPointer;
 		se->value.list.tail = InvalidDsaPointer;
 		populate_shared_from_scratch(se, scratch);
@@ -502,4 +558,177 @@ pg_redis_shared_store_writeback(PgRedisEntry *scratch)
 	}
 
 	LWLockRelease(plock);
+}
+
+/* -------------------------------------------------------------------------
+ * Atomic HSET / HDEL helpers — bypass scratch materialization and operate
+ * directly on the DSA hash table under LW_EXCLUSIVE. Each one performs the
+ * full mutation (type check, eviction, mutate, persistence event) in a
+ * single lock acquisition.
+ * ------------------------------------------------------------------------- */
+
+/* Build a transient stack-allocated PgRedisEntry that carries the metadata
+ * (key, type, expire, version) `pg_redis_event_encode_key_upsert` needs. */
+static void
+fill_event_entry(PgRedisEntry *out,
+				 const PgRedisSharedEntry *se,
+				 const char *key, Size keylen)
+{
+	memset(out, 0, sizeof(*out));
+	if (keylen > PG_REDIS_MAX_KEY_SIZE)
+		keylen = PG_REDIS_MAX_KEY_SIZE;
+	memcpy(out->key, key, keylen);
+	out->key[keylen] = '\0';
+	out->type = se->type;
+	out->expire_at = se->expire_at;
+	out->has_expire = se->has_expire;
+	out->version = se->version;
+}
+
+PgRedisFastHashMutateOutcome
+pg_redis_shared_hash_set_atomic(const char *key, Size keylen,
+								const char *field, Size fieldlen,
+								const unsigned char *value, Size value_len,
+								PgRedisValueType *out_actual)
+{
+	HTAB	   *ks = pg_redis_shmem_keyspace();
+	LWLock	   *plock = pg_redis_partition_lock(key, keylen);
+	bool		found;
+	PgRedisSharedEntry *se;
+	bool		was_new = false;
+
+	if (ks == NULL || plock == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_INTERNAL_ERROR),
+				 errmsg("pg_redis: shared keyspace not initialized")));
+
+	LWLockAcquire(plock, LW_EXCLUSIVE);
+	se = (PgRedisSharedEntry *) hash_search(ks, key, HASH_ENTER, &found);
+
+	if (!found)
+	{
+		/* New entry — init as HASH directly. */
+		MemSet(&se->value, 0, sizeof(se->value));
+		se->expire_at = 0;
+		se->has_expire = false;
+		se->version = 0;
+		se->type = PG_REDIS_TYPE_HASH;
+		se->value.scalar.dsa_value = InvalidDsaPointer;
+		se->value.hash.table = InvalidDsaPointer;
+		se->value.hash.field_count = 0;
+		se->value.list.head = InvalidDsaPointer;
+		se->value.list.tail = InvalidDsaPointer;
+	}
+	else if (se->has_expire && GetCurrentTimestamp() >= se->expire_at)
+	{
+		/* TTL-expired — treat as fresh insert. */
+		pg_redis_shared_entry_release_payloads(se);
+		MemSet(&se->value, 0, sizeof(se->value));
+		se->expire_at = 0;
+		se->has_expire = false;
+		se->version = 0;
+		se->type = PG_REDIS_TYPE_HASH;
+		se->value.scalar.dsa_value = InvalidDsaPointer;
+		se->value.hash.table = InvalidDsaPointer;
+		se->value.hash.field_count = 0;
+		se->value.list.head = InvalidDsaPointer;
+		se->value.list.tail = InvalidDsaPointer;
+	}
+	else if (se->type != PG_REDIS_TYPE_HASH)
+	{
+		PgRedisValueType actual = se->type;
+
+		if (out_actual)
+			*out_actual = actual;
+		LWLockRelease(plock);
+		return PG_REDIS_FAST_HASH_MUTATE_WRONGTYPE;
+	}
+
+	pg_redis_shared_hash_set(&se->value.hash.table,
+							 field, fieldlen,
+							 value, value_len,
+							 &was_new);
+	if (was_new)
+		se->value.hash.field_count++;
+	se->version++;
+
+	if (pg_redis_effective_persistence_mode() == PG_REDIS_PERSIST_ASYNC_TABLE)
+	{
+		PgRedisEntry stub;
+		PgRedisDirtyEvent ev;
+
+		fill_event_entry(&stub, se, key, keylen);
+		pg_redis_event_encode_key_upsert(&ev, &stub, NULL, 0);
+		pg_redis_dirty_ring_publish(&ev);
+		pg_redis_event_encode_hash_field_upsert(&ev, key, keylen,
+												field, fieldlen,
+												value, value_len);
+		pg_redis_dirty_ring_publish(&ev);
+		pg_redis_persistence_note_async_publish(2);
+	}
+
+	LWLockRelease(plock);
+	return was_new ? PG_REDIS_FAST_HASH_MUTATE_OK_NEW
+		: PG_REDIS_FAST_HASH_MUTATE_OK_OVERWRITE;
+}
+
+PgRedisFastHashMutateOutcome
+pg_redis_shared_hash_del_atomic(const char *key, Size keylen,
+								const char *field, Size fieldlen,
+								PgRedisValueType *out_actual)
+{
+	HTAB	   *ks = pg_redis_shmem_keyspace();
+	LWLock	   *plock = pg_redis_partition_lock(key, keylen);
+	bool		found;
+	PgRedisSharedEntry *se;
+	bool		removed;
+
+	if (ks == NULL || plock == NULL)
+		return PG_REDIS_FAST_HASH_MUTATE_NOOP;
+
+	LWLockAcquire(plock, LW_EXCLUSIVE);
+	se = (PgRedisSharedEntry *) hash_search(ks, key, HASH_FIND, &found);
+	if (!found)
+	{
+		LWLockRelease(plock);
+		return PG_REDIS_FAST_HASH_MUTATE_NOOP;
+	}
+	if (se->has_expire && GetCurrentTimestamp() >= se->expire_at)
+	{
+		/* Drop the expired entry under the lock we already hold. */
+		pg_redis_shared_entry_release_payloads(se);
+		hash_search(ks, key, HASH_REMOVE, &found);
+		LWLockRelease(plock);
+		return PG_REDIS_FAST_HASH_MUTATE_NOOP;
+	}
+	if (se->type != PG_REDIS_TYPE_HASH)
+	{
+		PgRedisValueType actual = se->type;
+
+		if (out_actual)
+			*out_actual = actual;
+		LWLockRelease(plock);
+		return PG_REDIS_FAST_HASH_MUTATE_WRONGTYPE;
+	}
+
+	removed = pg_redis_shared_hash_del(&se->value.hash.table, field, fieldlen);
+	if (!removed)
+	{
+		LWLockRelease(plock);
+		return PG_REDIS_FAST_HASH_MUTATE_NOOP;
+	}
+	se->value.hash.field_count--;
+	se->version++;
+
+	if (pg_redis_effective_persistence_mode() == PG_REDIS_PERSIST_ASYNC_TABLE)
+	{
+		PgRedisDirtyEvent ev;
+
+		pg_redis_event_encode_hash_field_delete(&ev, key, keylen, field, fieldlen);
+		pg_redis_dirty_ring_publish(&ev);
+		pg_redis_persistence_note_async_publish(1);
+	}
+
+	LWLockRelease(plock);
+	return PG_REDIS_FAST_HASH_MUTATE_OK_DELETED;
 }

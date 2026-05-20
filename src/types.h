@@ -113,19 +113,37 @@ typedef struct PgRedisEntry
 	Size		string_len;		/* for string_value */
 } PgRedisEntry;
 
-/* Shared-memory hash field — node in a DSA-backed linked list. One per
- * (key, field) pair. The chain head sits on PgRedisSharedEntry.value.hash.
- * Simple linked list (vs DSA HTAB) keeps the data structures uniform and
- * minimal; HGET cost grows O(N) per hash, acceptable for cache-shaped hashes
- * (small N). */
-typedef struct PgRedisSharedHashField
+/* Shared-memory hash field bucket — slot in a DSA-backed open-addressing
+ * hash table. One bucket per slot in the table; OCCUPIED buckets correspond
+ * to a (field, value) pair. Field and value bytes live in separate DSA
+ * chunks pointed at by field_dsa / value_dsa. The bucket array itself sits
+ * after a PgRedisSharedHashTable header in a single DSA allocation. */
+typedef enum PgRedisSharedHashBucketState
 {
-	dsa_pointer next;			/* dsa_pointer to next PgRedisSharedHashField, or InvalidDsaPointer */
+	PG_REDIS_SHB_EMPTY = 0,
+	PG_REDIS_SHB_OCCUPIED,
+	PG_REDIS_SHB_TOMBSTONE
+} PgRedisSharedHashBucketState;
+
+typedef struct PgRedisSharedHashBucket
+{
+	uint16		state;			/* PgRedisSharedHashBucketState */
 	uint16		field_len;
 	uint16		value_len;
-	dsa_pointer field_dsa;		/* field name bytes */
-	dsa_pointer value_dsa;		/* value bytes */
-} PgRedisSharedHashField;
+	uint16		_pad;
+	dsa_pointer field_dsa;		/* field name bytes (when OCCUPIED) */
+	dsa_pointer value_dsa;		/* value bytes (when OCCUPIED) */
+} PgRedisSharedHashBucket;
+
+/* Header for a per-key shared hash table. The bucket array of length
+ * `bucket_count` is laid out contiguously immediately after the header in
+ * the same DSA allocation, addressable via (PgRedisSharedHashBucket *)(header + 1). */
+typedef struct PgRedisSharedHashTable
+{
+	int64		bucket_count;	/* power of two, >= initial size */
+	int64		occupied;		/* live OCCUPIED buckets */
+	int64		tombstones;		/* TOMBSTONE buckets — affect probe length */
+} PgRedisSharedHashTable;
 
 /* Shared-memory list node — node in a DSA-backed doubly-linked list. The
  * head/tail pointers sit on PgRedisSharedEntry.value.list. */
@@ -160,7 +178,7 @@ typedef struct PgRedisSharedEntry
 		}			scalar;
 		struct
 		{
-			dsa_pointer fields_head;	/* dsa_pointer to first PgRedisSharedHashField */
+			dsa_pointer table;		/* dsa_pointer to PgRedisSharedHashTable (header + bucket array) */
 			int64		field_count;
 		}			hash;
 		struct

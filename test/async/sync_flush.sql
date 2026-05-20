@@ -18,10 +18,8 @@
 -- the drain succeeds without aborting the outer xact.
 --
 -- We use SET (one event per call, distinct keys) rather than HSET on the
--- same hash. HSET-on-same-key currently re-publishes every existing field
--- in the hash on each call (a separate pre-existing O(N^2) issue in
--- pg_redis_shared_hash_materialize), which would dominate the test and
--- obscure what we're actually exercising here.
+-- same hash to keep the event count proportional to the number of calls —
+-- exactly what the ring-overflow path needs.
 
 \set ON_ERROR_STOP on
 

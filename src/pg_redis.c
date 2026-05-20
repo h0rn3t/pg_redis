@@ -621,6 +621,43 @@ pg_redis_hset(PG_FUNCTION_ARGS)
 										   &field_len, false, true);
 	val = argtext_to_pstring(val_t, &val_len, false);
 
+	/* Shared-mode fast path: mutate the DSA hash table in place under
+	 * LW_EXCLUSIVE, skipping scratch materialize. */
+	if (pg_redis_storage_is_shared())
+	{
+		PgRedisValueType actual = 0;
+		PgRedisFastHashMutateOutcome outcome;
+
+		outcome = pg_redis_shared_hash_set_atomic(key, key_len,
+												  field, field_len,
+												  (const unsigned char *) val,
+												  val_len,
+												  &actual);
+		switch (outcome)
+		{
+			case PG_REDIS_FAST_HASH_MUTATE_OK_NEW:
+				pg_redis_free_cstring_stack(keybuf, key);
+				pg_redis_free_cstring_stack(fieldbuf, field);
+				pfree(val);
+				PG_RETURN_BOOL(true);
+			case PG_REDIS_FAST_HASH_MUTATE_OK_OVERWRITE:
+				pg_redis_free_cstring_stack(keybuf, key);
+				pg_redis_free_cstring_stack(fieldbuf, field);
+				pfree(val);
+				PG_RETURN_BOOL(false);
+			case PG_REDIS_FAST_HASH_MUTATE_WRONGTYPE:
+				pg_redis_free_cstring_stack(keybuf, key);
+				pg_redis_free_cstring_stack(fieldbuf, field);
+				pfree(val);
+				pg_redis_wrongtype(key, actual, PG_REDIS_TYPE_HASH);
+				break;				/* unreachable */
+			default:
+				/* KEY_EXPIRED / NOOP shouldn't occur on HSET — defensive
+				 * fall-through to the slow path. */
+				break;
+		}
+	}
+
 	e = pg_redis_store_upsert(key, &is_new);
 	if (!is_new && e->type != PG_REDIS_TYPE_HASH)
 	{
@@ -670,6 +707,50 @@ pg_redis_hget(PG_FUNCTION_ARGS)
 	field = pg_redis_text_to_cstring_stack(field_t, fieldbuf, sizeof(fieldbuf),
 										   &field_len, false, true);
 
+	/* Shared-mode fast path: look up the field directly under LW_SHARED,
+	 * skipping the per-call materialize_scratch that would otherwise copy
+	 * every field of the hash into local memory. */
+	if (pg_redis_storage_is_shared())
+	{
+		unsigned char *vbuf = NULL;
+		Size		vbuf_len = 0;
+		PgRedisValueType actual = 0;
+		PgRedisFastHashOutcome outcome;
+
+		outcome = pg_redis_shared_hash_lookup_field(key, key_len,
+													field, field_len,
+													true,
+													&vbuf, &vbuf_len,
+													&actual);
+		switch (outcome)
+		{
+			case PG_REDIS_FAST_HASH_HIT:
+				{
+					text	   *out = cstring_to_text_with_len((char *) vbuf, vbuf_len);
+
+					if (vbuf != NULL)
+						pfree(vbuf);
+					pg_redis_free_cstring_stack(keybuf, key);
+					pg_redis_free_cstring_stack(fieldbuf, field);
+					PG_RETURN_TEXT_P(out);
+				}
+			case PG_REDIS_FAST_HASH_FIELD_MISS:
+			case PG_REDIS_FAST_HASH_KEY_MISS:
+				pg_redis_free_cstring_stack(keybuf, key);
+				pg_redis_free_cstring_stack(fieldbuf, field);
+				PG_RETURN_NULL();
+			case PG_REDIS_FAST_HASH_WRONGTYPE:
+				pg_redis_free_cstring_stack(keybuf, key);
+				pg_redis_free_cstring_stack(fieldbuf, field);
+				pg_redis_wrongtype(key, actual, PG_REDIS_TYPE_HASH);
+				break;				/* unreachable: pg_redis_wrongtype ereports */
+			case PG_REDIS_FAST_HASH_KEY_EXPIRED:
+				/* Fall through to the slow path so the entry gets evicted
+				 * under LW_EXCLUSIVE. */
+				break;
+		}
+	}
+
 	e = pg_redis_store_lookup(key, NULL);
 	if (e == NULL)
 	{
@@ -713,6 +794,35 @@ pg_redis_hdel(PG_FUNCTION_ARGS)
 										 &key_len, true, false);
 	field = pg_redis_text_to_cstring_stack(field_t, fieldbuf, sizeof(fieldbuf),
 										   &field_len, false, true);
+
+	/* Shared-mode fast path — symmetric to pg_redis_hset. */
+	if (pg_redis_storage_is_shared())
+	{
+		PgRedisValueType actual = 0;
+		PgRedisFastHashMutateOutcome outcome;
+
+		outcome = pg_redis_shared_hash_del_atomic(key, key_len,
+												  field, field_len,
+												  &actual);
+		switch (outcome)
+		{
+			case PG_REDIS_FAST_HASH_MUTATE_OK_DELETED:
+				pg_redis_free_cstring_stack(keybuf, key);
+				pg_redis_free_cstring_stack(fieldbuf, field);
+				PG_RETURN_BOOL(true);
+			case PG_REDIS_FAST_HASH_MUTATE_NOOP:
+				pg_redis_free_cstring_stack(keybuf, key);
+				pg_redis_free_cstring_stack(fieldbuf, field);
+				PG_RETURN_BOOL(false);
+			case PG_REDIS_FAST_HASH_MUTATE_WRONGTYPE:
+				pg_redis_free_cstring_stack(keybuf, key);
+				pg_redis_free_cstring_stack(fieldbuf, field);
+				pg_redis_wrongtype(key, actual, PG_REDIS_TYPE_HASH);
+				break;				/* unreachable */
+			default:
+				break;
+		}
+	}
 
 	e = pg_redis_store_lookup(key, NULL);
 	if (e == NULL)
@@ -760,6 +870,39 @@ pg_redis_hexists(PG_FUNCTION_ARGS)
 										 &key_len, true, false);
 	field = pg_redis_text_to_cstring_stack(field_t, fieldbuf, sizeof(fieldbuf),
 										   &field_len, false, true);
+
+	/* Shared-mode fast path — same shape as pg_redis_hget. */
+	if (pg_redis_storage_is_shared())
+	{
+		PgRedisValueType actual = 0;
+		PgRedisFastHashOutcome outcome;
+
+		outcome = pg_redis_shared_hash_lookup_field(key, key_len,
+													field, field_len,
+													false,
+													NULL, NULL,
+													&actual);
+		switch (outcome)
+		{
+			case PG_REDIS_FAST_HASH_HIT:
+				pg_redis_free_cstring_stack(keybuf, key);
+				pg_redis_free_cstring_stack(fieldbuf, field);
+				PG_RETURN_BOOL(true);
+			case PG_REDIS_FAST_HASH_FIELD_MISS:
+			case PG_REDIS_FAST_HASH_KEY_MISS:
+				pg_redis_free_cstring_stack(keybuf, key);
+				pg_redis_free_cstring_stack(fieldbuf, field);
+				PG_RETURN_BOOL(false);
+			case PG_REDIS_FAST_HASH_WRONGTYPE:
+				pg_redis_free_cstring_stack(keybuf, key);
+				pg_redis_free_cstring_stack(fieldbuf, field);
+				pg_redis_wrongtype(key, actual, PG_REDIS_TYPE_HASH);
+				break;
+			case PG_REDIS_FAST_HASH_KEY_EXPIRED:
+				/* Fall through for lazy eviction under LW_EXCLUSIVE. */
+				break;
+		}
+	}
 
 	e = pg_redis_store_lookup(key, NULL);
 	if (e == NULL)
