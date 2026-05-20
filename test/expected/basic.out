@@ -1,0 +1,133 @@
+-- basic SET/GET/DEL/EXISTS, overwrite, missing key, MEMORY_USAGE / FLUSHALL
+CREATE EXTENSION pg_redis;
+-- Missing key
+SELECT pgredis."GET"('nope') IS NULL AS missing_is_null;
+ missing_is_null 
+-----------------
+ t
+(1 row)
+
+SELECT pgredis."EXISTS"('nope');
+ EXISTS 
+--------
+ f
+(1 row)
+
+-- SET / GET / EXISTS
+SELECT pgredis."SET"('k1', 'hello');
+ SET 
+-----
+ t
+(1 row)
+
+SELECT pgredis."GET"('k1');
+  GET  
+-------
+ hello
+(1 row)
+
+SELECT pgredis."EXISTS"('k1');
+ EXISTS 
+--------
+ t
+(1 row)
+
+-- Overwrite
+SELECT pgredis."SET"('k1', 'world');
+ SET 
+-----
+ t
+(1 row)
+
+SELECT pgredis."GET"('k1');
+  GET  
+-------
+ world
+(1 row)
+
+-- DEL
+SELECT pgredis."DEL"('k1');
+ DEL 
+-----
+ t
+(1 row)
+
+SELECT pgredis."DEL"('k1');                 -- false: already gone
+ DEL 
+-----
+ f
+(1 row)
+
+SELECT pgredis."EXISTS"('k1');
+ EXISTS 
+--------
+ f
+(1 row)
+
+-- INCR / DECR
+SELECT pgredis."INCR"('counter');           -- 1
+ INCR 
+------
+    1
+(1 row)
+
+SELECT pgredis."INCR"('counter');           -- 2
+ INCR 
+------
+    2
+(1 row)
+
+SELECT pgredis."DECR"('counter');           -- 1
+ DECR 
+------
+    1
+(1 row)
+
+SELECT pgredis."GET"('counter');            -- '1'
+ GET 
+-----
+ 1
+(1 row)
+
+-- INCR on non-numeric
+SELECT pgredis."SET"('bad', 'not-a-number');
+ SET 
+-----
+ t
+(1 row)
+
+DO $$
+BEGIN
+    PERFORM pgredis."INCR"('bad');
+    RAISE EXCEPTION 'expected INCR on non-numeric to fail';
+EXCEPTION WHEN OTHERS THEN
+    RAISE NOTICE 'INCR rejected non-numeric value: %', SQLERRM;
+END$$;
+NOTICE:  INCR rejected non-numeric value: pg_redis: value at key "bad" is not an integer
+-- MEMORY_USAGE > 0 while keys exist
+SELECT pgredis."MEMORY_USAGE"() > 0 AS mem_positive;
+ mem_positive 
+--------------
+ t
+(1 row)
+
+-- FLUSHALL clears everything
+SELECT pgredis."FLUSHALL"();
+ FLUSHALL 
+----------
+ t
+(1 row)
+
+SELECT pgredis."MEMORY_USAGE"();
+ MEMORY_USAGE 
+--------------
+            0
+(1 row)
+
+SELECT count(*) FROM pgredis."KEYS"();
+ count 
+-------
+     0
+(1 row)
+
+DROP EXTENSION pg_redis CASCADE;

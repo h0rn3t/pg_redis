@@ -1,0 +1,90 @@
+-- HSET / HGET / HDEL / HEXISTS + WRONGTYPE
+CREATE EXTENSION pg_redis;
+-- HSET on new key creates the hash
+SELECT pgredis."HSET"('u', 'name', 'Alice');  -- true (new field)
+ HSET 
+------
+ t
+(1 row)
+
+SELECT pgredis."HSET"('u', 'name', 'Bob');    -- false (overwrote)
+ HSET 
+------
+ f
+(1 row)
+
+SELECT pgredis."HGET"('u', 'name');           -- 'Bob'
+ HGET 
+------
+ Bob
+(1 row)
+
+SELECT pgredis."HSET"('u', 'age', '30');
+ HSET 
+------
+ t
+(1 row)
+
+SELECT pgredis."HEXISTS"('u', 'age');
+ HEXISTS 
+---------
+ t
+(1 row)
+
+SELECT pgredis."HEXISTS"('u', 'no-such');
+ HEXISTS 
+---------
+ f
+(1 row)
+
+-- HGET on missing field
+SELECT pgredis."HGET"('u', 'no-such') IS NULL AS missing_field_is_null;
+ missing_field_is_null 
+-----------------------
+ t
+(1 row)
+
+-- HDEL
+SELECT pgredis."HDEL"('u', 'age');            -- true
+ HDEL 
+------
+ t
+(1 row)
+
+SELECT pgredis."HDEL"('u', 'age');            -- false (already gone)
+ HDEL 
+------
+ f
+(1 row)
+
+SELECT pgredis."HEXISTS"('u', 'age');
+ HEXISTS 
+---------
+ f
+(1 row)
+
+-- WRONGTYPE: HSET on a string key
+SELECT pgredis."SET"('s', 'hi');
+ SET 
+-----
+ t
+(1 row)
+
+DO $$
+BEGIN
+    PERFORM pgredis."HSET"('s', 'f', 'v');
+    RAISE EXCEPTION 'expected WRONGTYPE';
+EXCEPTION WHEN SQLSTATE '42804' THEN
+    RAISE NOTICE 'WRONGTYPE: %', SQLERRM;
+END$$;
+NOTICE:  WRONGTYPE: pg_redis: WRONGTYPE operation against key holding the wrong kind of value
+-- WRONGTYPE: GET on a hash key
+DO $$
+BEGIN
+    PERFORM pgredis."GET"('u');
+    RAISE EXCEPTION 'expected WRONGTYPE';
+EXCEPTION WHEN SQLSTATE '42804' THEN
+    RAISE NOTICE 'WRONGTYPE: %', SQLERRM;
+END$$;
+NOTICE:  WRONGTYPE: pg_redis: WRONGTYPE operation against key holding the wrong kind of value
+DROP EXTENSION pg_redis CASCADE;

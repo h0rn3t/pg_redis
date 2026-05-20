@@ -1,0 +1,107 @@
+-- STATS / INFO / SAVE / BGSAVE / BGREWRITEAOF / KEYS / PG18 virtual column.
+CREATE EXTENSION pg_redis;
+-- Empty store: every counter is zero.
+SELECT key_count, string_count, int_count, hash_count, list_count, expiring_count
+  FROM pgredis."STATS"();
+ key_count | string_count | int_count | hash_count | list_count | expiring_count 
+-----------+--------------+-----------+------------+------------+----------------
+         0 |            0 |         0 |          0 |          0 |              0
+(1 row)
+
+-- Populate one of each type.
+SELECT pgredis."SET"('s', 'hello');
+ SET 
+-----
+ t
+(1 row)
+
+SELECT pgredis."INCR"('c');                   -- creates an int
+ INCR 
+------
+    1
+(1 row)
+
+SELECT pgredis."HSET"('h', 'f', 'v');
+ HSET 
+------
+ t
+(1 row)
+
+SELECT pgredis."RPUSH"('l', 'v');
+ RPUSH 
+-------
+     1
+(1 row)
+
+-- STATS reflects the population.
+SELECT key_count, string_count, int_count, hash_count, list_count, expiring_count
+  FROM pgredis."STATS"();
+ key_count | string_count | int_count | hash_count | list_count | expiring_count 
+-----------+--------------+-----------+------------+------------+----------------
+         4 |            1 |         1 |          1 |          1 |              0
+(1 row)
+
+-- INFO returns non-empty text.
+SELECT length(pgredis."INFO"()) > 0 AS info_nonempty;
+ info_nonempty 
+---------------
+ t
+(1 row)
+
+-- KEYS returns every key (ordered for determinism).
+SELECT key FROM pgredis."KEYS"() AS t(key) ORDER BY key;
+ key 
+-----
+ c
+ h
+ l
+ s
+(4 rows)
+
+-- PG18 virtual generated column on pgredis.store.
+SELECT key, key_bytes FROM pgredis.store ORDER BY key;
+ key | key_bytes 
+-----+-----------
+ c   |         1
+ h   |         1
+ l   |         1
+ s   |         1
+(4 rows)
+
+-- SAVE writes a row with a UUIDv7 id (PG18 feature).
+SELECT pgredis."SAVE"();
+ SAVE 
+------
+ t
+(1 row)
+
+SELECT pg_typeof(snapshot_id)::text AS id_type, key_count
+  FROM pgredis.snapshots ORDER BY created_at LIMIT 1;
+ id_type | key_count 
+---------+-----------
+ uuid    |         4
+(1 row)
+
+-- BGSAVE schedules a snapshot_save job (returns true).
+SELECT pgredis."BGSAVE"();
+ BGSAVE 
+--------
+ t
+(1 row)
+
+SELECT count(*) > 0 AS bgsave_scheduled
+  FROM pgredis.jobs WHERE job_type = 'snapshot_save';
+ bgsave_scheduled 
+------------------
+ t
+(1 row)
+
+-- BGREWRITEAOF returns false in v0.1 and raises a NOTICE.
+SELECT pgredis."BGREWRITEAOF"();
+NOTICE:  pg_redis: AOF rewrite not implemented in v0.1
+ BGREWRITEAOF 
+--------------
+ f
+(1 row)
+
+DROP EXTENSION pg_redis CASCADE;

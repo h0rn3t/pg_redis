@@ -1,0 +1,149 @@
+-- LPUSH / RPUSH / LPOP / RPOP / LLEN, empty list NULL, WRONGTYPE
+CREATE EXTENSION pg_redis;
+-- LLEN on missing key returns 0
+SELECT pgredis."LLEN"('q');
+ LLEN 
+------
+    0
+(1 row)
+
+-- LPUSH adds to head, RPUSH to tail
+SELECT pgredis."RPUSH"('q', 'a');             -- 1
+ RPUSH 
+-------
+     1
+(1 row)
+
+SELECT pgredis."RPUSH"('q', 'b');             -- 2
+ RPUSH 
+-------
+     2
+(1 row)
+
+SELECT pgredis."RPUSH"('q', 'c');             -- 3
+ RPUSH 
+-------
+     3
+(1 row)
+
+SELECT pgredis."LPUSH"('q', 'X');             -- 4
+ LPUSH 
+-------
+     4
+(1 row)
+
+SELECT pgredis."LLEN"('q');
+ LLEN 
+------
+    4
+(1 row)
+
+-- LPOP returns head (X), RPOP returns tail (c)
+SELECT pgredis."LPOP"('q');
+ LPOP 
+------
+ X
+(1 row)
+
+SELECT pgredis."RPOP"('q');
+ RPOP 
+------
+ c
+(1 row)
+
+SELECT pgredis."LLEN"('q');                   -- 2 (a, b remain)
+ LLEN 
+------
+    2
+(1 row)
+
+-- Drain to empty
+SELECT pgredis."LPOP"('q');
+ LPOP 
+------
+ a
+(1 row)
+
+SELECT pgredis."LPOP"('q');
+ LPOP 
+------
+ b
+(1 row)
+
+SELECT pgredis."LLEN"('q');                   -- 0
+ LLEN 
+------
+    0
+(1 row)
+
+SELECT pgredis."LPOP"('q') IS NULL AS empty_pop_is_null;
+ empty_pop_is_null 
+-------------------
+ t
+(1 row)
+
+SELECT pgredis."EXISTS"('q');                 -- true: empty list is retained
+ EXISTS 
+--------
+ t
+(1 row)
+
+-- LIFO check: LPUSH a, b, c then LPOP three times -> c, b, a
+SELECT pgredis."DEL"('lifo');
+ DEL 
+-----
+ f
+(1 row)
+
+SELECT pgredis."LPUSH"('lifo', 'a');
+ LPUSH 
+-------
+     1
+(1 row)
+
+SELECT pgredis."LPUSH"('lifo', 'b');
+ LPUSH 
+-------
+     2
+(1 row)
+
+SELECT pgredis."LPUSH"('lifo', 'c');
+ LPUSH 
+-------
+     3
+(1 row)
+
+SELECT pgredis."LPOP"('lifo');                -- c
+ LPOP 
+------
+ c
+(1 row)
+
+SELECT pgredis."LPOP"('lifo');                -- b
+ LPOP 
+------
+ b
+(1 row)
+
+SELECT pgredis."LPOP"('lifo');                -- a
+ LPOP 
+------
+ a
+(1 row)
+
+-- WRONGTYPE: LPUSH on a hash key
+SELECT pgredis."HSET"('h', 'f', 'v');
+ HSET 
+------
+ t
+(1 row)
+
+DO $$
+BEGIN
+    PERFORM pgredis."LPUSH"('h', 'v');
+    RAISE EXCEPTION 'expected WRONGTYPE';
+EXCEPTION WHEN SQLSTATE '42804' THEN
+    RAISE NOTICE 'WRONGTYPE: %', SQLERRM;
+END$$;
+NOTICE:  WRONGTYPE: pg_redis: WRONGTYPE operation against key holding the wrong kind of value
+DROP EXTENSION pg_redis CASCADE;

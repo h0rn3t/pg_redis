@@ -1,0 +1,113 @@
+-- sync_table write-through + SAVE/snapshots + rollback semantics
+CREATE EXTENSION pg_redis;
+SHOW pg_redis.persistence_mode;
+ pg_redis.persistence_mode 
+---------------------------
+ sync_table
+(1 row)
+
+-- SET writes a row in pgredis.store
+SELECT pgredis."SET"('p:1', 'one');
+ SET 
+-----
+ t
+(1 row)
+
+SELECT key, type, value FROM pgredis.store WHERE key = 'p:1';
+ key |  type  |      value       
+-----+--------+------------------
+ p:1 | string | {"value": "one"}
+(1 row)
+
+-- HSET shape
+SELECT pgredis."HSET"('p:h', 'name', 'Alice');
+ HSET 
+------
+ t
+(1 row)
+
+SELECT pgredis."HSET"('p:h', 'age', '30');
+ HSET 
+------
+ t
+(1 row)
+
+SELECT type, value->'fields'->>'name' AS name,
+              value->'fields'->>'age' AS age
+  FROM pgredis.store WHERE key = 'p:h';
+ type | name  | age 
+------+-------+-----
+ hash | Alice | 30
+(1 row)
+
+-- RPUSH shape (list ordering preserved)
+SELECT pgredis."RPUSH"('p:l', 'a');
+ RPUSH 
+-------
+     1
+(1 row)
+
+SELECT pgredis."RPUSH"('p:l', 'b');
+ RPUSH 
+-------
+     2
+(1 row)
+
+SELECT type, jsonb_array_length(value->'items') AS n,
+              value->'items'->>0 AS first
+  FROM pgredis.store WHERE key = 'p:l';
+ type | n | first 
+------+---+-------
+ list | 2 | a
+(1 row)
+
+-- DEL removes the durable row
+SELECT pgredis."DEL"('p:1');
+ DEL 
+-----
+ t
+(1 row)
+
+SELECT count(*) FROM pgredis.store WHERE key = 'p:1';   -- 0
+ count 
+-------
+     0
+(1 row)
+
+-- ROLLBACK: durable row must not survive
+BEGIN;
+SELECT pgredis."SET"('p:rb', 'tmp');
+ SET 
+-----
+ t
+(1 row)
+
+ROLLBACK;
+SELECT count(*) FROM pgredis.store WHERE key = 'p:rb'; -- 0
+ count 
+-------
+     0
+(1 row)
+
+-- SAVE writes a row in pgredis.snapshots
+SELECT pgredis."SAVE"();
+ SAVE 
+------
+ t
+(1 row)
+
+SELECT count(*) FROM pgredis.snapshots WHERE key_count >= 0;
+ count 
+-------
+     1
+(1 row)
+
+-- BGREWRITEAOF returns false with NOTICE
+SELECT pgredis."BGREWRITEAOF"();
+NOTICE:  pg_redis: AOF rewrite not implemented in v0.1
+ BGREWRITEAOF 
+--------------
+ f
+(1 row)
+
+DROP EXTENSION pg_redis CASCADE;

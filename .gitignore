@@ -1,0 +1,22 @@
+# OpenSpec workspace (not tracked here)
+openspec
+
+# Build artifacts
+*.o
+*.so
+*.bc
+*.dylib
+src/*.o
+src/*.bc
+
+# PGXS regression test output (under test/ because of REGRESS_OPTS)
+test/results/
+test/regression.diffs
+test/regression.out
+test/log/
+test/tmp_check/
+
+# Editor / IDE
+.DS_Store
+.idea/
+.vscode/

@@ -1,0 +1,56 @@
+services:
+  redis:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 10
+
+  pg_redis:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runtime
+      args:
+        PG_VERSION: "${PG_VERSION:-18}"
+    image: pg_redis:${PG_VERSION:-18}
+    environment:
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: postgres
+    # Enable shared-keyspace + async-table mode. shared_preload_libraries must
+    # be set before postmaster start so _PG_init runs in shmem-request context.
+    command:
+      - "postgres"
+      - "-c"
+      - "shared_preload_libraries=pg_redis"
+      - "-c"
+      - "pg_redis.storage_mode=shared"
+      - "-c"
+      - "pg_redis.persistence_mode=async_table"
+      - "-c"
+      - "pg_redis.enable_background_worker=on"
+      - "-c"
+      - "pg_redis.shared_max_memory=256MB"
+      - "-c"
+      - "pg_redis.dirty_ring_size=65536"
+      - "-c"
+      - "pg_redis.lock_partitions=16"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+
+  bench:
+    build:
+      context: ./bench
+    depends_on:
+      redis:
+        condition: service_healthy
+      pg_redis:
+        condition: service_healthy
+    environment:
+      REDIS_URL: "redis://redis:6379/0"
+      PG_DSN: "postgresql://postgres:postgres@pg_redis:5432/postgres"
+      BENCH_N: "${BENCH_N:-1000}"

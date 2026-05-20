@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Skill(openspec-apply-change)",
+      "Skill(openspec-apply-change:*)",
+      "Skill(opsx:new)",
+      "Skill(opsx:new:*)",
+      "Skill(openspec-archive-change)",
+      "Skill(openspec-archive-change:*)",
+      "Skill(opsx:apply)",
+      "Skill(opsx:apply:*)"
+    ]
+  }
+}
