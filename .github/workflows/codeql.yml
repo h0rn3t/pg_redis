@@ -1,0 +1,72 @@
+name: "CodeQL"
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+  schedule:
+    # Weekly scan (Mondays 05:30 UTC) to catch newly-published query updates.
+    - cron: "30 5 * * 1"
+
+jobs:
+  analyze:
+    name: Analyze (${{ matrix.language }})
+    runs-on: ubuntu-latest
+    permissions:
+      # Required to upload results to the code-scanning dashboard.
+      security-events: write
+      # Only needed for workflows in private repositories.
+      actions: read
+      contents: read
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - language: c-cpp
+            build-mode: manual
+
+    # pg_redis is a C PostgreSQL extension, so CodeQL must observe a real
+    # compile. We build it manually against PostgreSQL 18 dev headers.
+    env:
+      PG_VERSION: "18"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install PostgreSQL ${{ env.PG_VERSION }} build dependencies
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends curl ca-certificates gnupg lsb-release build-essential
+          # Add the PGDG apt repository (Ubuntu's default repos do not ship PG 18 dev headers).
+          sudo install -d /usr/share/postgresql-common/pgdg
+          sudo curl -fsSL -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc \
+            https://www.postgresql.org/media/keys/ACCC4CF8.asc
+          echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \
+            | sudo tee /etc/apt/sources.list.d/pgdg.list
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends "postgresql-server-dev-${PG_VERSION}"
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: ${{ matrix.build-mode }}
+          # Use the broader query suite for deeper security coverage.
+          queries: security-extended
+
+      - name: Build pg_redis
+        run: |
+          set -euxo pipefail
+          # Pin PG_CONFIG to PG 18 — the runner may have an older pg_config on PATH,
+          # but the extension requires PostgreSQL 18+.
+          make clean PG_CONFIG="/usr/lib/postgresql/${PG_VERSION}/bin/pg_config" || true
+          make PG_CONFIG="/usr/lib/postgresql/${PG_VERSION}/bin/pg_config"
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:${{ matrix.language }}"
