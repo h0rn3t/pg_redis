@@ -1,0 +1,106 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      pg_version:
+        description: PostgreSQL major version
+        default: '18'
+        required: false
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  regression-pg18:
+    runs-on: ubuntu-latest
+    env:
+      PG_VERSION: ${{ inputs.pg_version || '18' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Run regression tests
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: test
+          build-args: PG_VERSION=${{ env.PG_VERSION }}
+          push: false
+          cache-from: type=gha,scope=regression-pg${{ env.PG_VERSION }}
+          cache-to: type=gha,mode=max,scope=regression-pg${{ env.PG_VERSION }}
+
+      - name: Extract test artifacts
+        if: failure()
+        run: |
+          docker buildx build \
+            --target builder \
+            --build-arg "PG_VERSION=$PG_VERSION" \
+            --cache-from "type=gha,scope=regression-pg$PG_VERSION" \
+            --load \
+            -t pg-redis-builder \
+            .
+          mkdir -p _artifacts
+          docker run --rm \
+            -v "$PWD/_artifacts:/out" \
+            pg-redis-builder \
+            sh -c '/usr/local/bin/docker-test.sh || true
+                   cp -r test/results /out/ 2>/dev/null || true
+                   find test -name regression.diffs -exec cp {} /out/ \; 2>/dev/null || true'
+
+      - name: Upload regression artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: regression-results-pg${{ env.PG_VERSION }}
+          path: _artifacts/**
+          if-no-files-found: ignore
+
+  async-pg18:
+    runs-on: ubuntu-latest
+    env:
+      PG_VERSION: ${{ inputs.pg_version || '18' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Run async tests
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: test-async
+          build-args: PG_VERSION=${{ env.PG_VERSION }}
+          push: false
+          cache-from: type=gha,scope=async-pg${{ env.PG_VERSION }}
+          cache-to: type=gha,mode=max,scope=async-pg${{ env.PG_VERSION }}
+
+      - name: Extract async artifacts
+        if: failure()
+        run: |
+          docker buildx build \
+            --target builder \
+            --build-arg "PG_VERSION=$PG_VERSION" \
+            --cache-from "type=gha,scope=async-pg$PG_VERSION" \
+            --load \
+            -t pg-redis-builder \
+            .
+          mkdir -p _artifacts
+          docker run --rm \
+            -v "$PWD/_artifacts:/out" \
+            pg-redis-builder \
+            sh -c 'LOGFILE=/out/pg-async.log /usr/local/bin/docker-test-async.sh || true'
+
+      - name: Upload async artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: async-results-pg${{ env.PG_VERSION }}
+          path: _artifacts/**
+          if-no-files-found: ignore

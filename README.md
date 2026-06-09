@@ -1,5 +1,7 @@
 # pg_redis
 
+[![CI](https://github.com/h0rn3t/pg_redis/actions/workflows/ci.yml/badge.svg)](https://github.com/h0rn3t/pg_redis/actions/workflows/ci.yml)
+
 `pg_redis` — розширення PostgreSQL, написане на C, що вбудовує Redis-подібне
 сховище ключ-значення в пам'яті безпосередньо у PostgreSQL-бекенд і відкриває
 його через SQL-функції зі схеми `pgredis` у вигляді іменованих лапками
@@ -271,6 +273,20 @@ make docker-down
 ```bash
 make docker-regen
 ```
+
+## CI
+
+GitHub Actions запускає два паралельні джоби при кожному push до `main` та
+при кожному pull request:
+
+| Джоб | Команда | Що перевіряє |
+| --- | --- | --- |
+| `regression-pg18` | `make docker-test PG_VERSION=18` | Повний `pg_regress` suite (basic, ttl, hashes, lists, persistence, flush, admin, jobs, async_table) |
+| `async-pg18` | `make docker-test-async PG_VERSION=18` | `test/async/*.sql` — сценарії зі `shared_preload_libraries=pg_redis` та `storage_mode=shared`, які `pg_regress` не може покрити |
+
+При падінні джобу відповідний артефакт (`regression-results-pg18` або
+`async-results-pg18`) завантажується в GitHub Actions і містить `test/results/`,
+`regression.diffs` або лог кластера для локального дебагу.
 
 ## Бенчмарк vs Redis
 
