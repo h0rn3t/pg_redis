@@ -53,6 +53,9 @@ int			pg_redis_shared_max_memory_mb = 256;
 int			pg_redis_dirty_ring_size = 65536;
 int			pg_redis_lock_partitions = 16;
 int			pg_redis_async_full_action = PG_REDIS_ASYNC_FULL_BLOCK;
+int			pg_redis_ring_reclaim_tick_interval = 1024;
+int			pg_redis_ring_slot_stuck_timeout_ms = 5000;
+char	   *pg_redis_bgworker_database = NULL;
 
 /* Enum value table for pg_redis.async_full_action. */
 static const struct config_enum_entry async_full_action_options[] = {
@@ -262,6 +265,18 @@ _PG_init(void)
 								PGC_POSTMASTER,
 								0,
 								NULL, NULL, NULL);
+
+		DefineCustomStringVariable("pg_redis.bgworker_database",
+								   "Database the pg_redis background worker connects to.",
+								   "The bgworker needs a database connection for SPI. "
+								   "If this database does not exist the worker logs one "
+								   "FATAL and does NOT restart (BGW_NEVER_RESTART) instead "
+								   "of looping.",
+								   &pg_redis_bgworker_database,
+								   "postgres",
+								   PGC_POSTMASTER,
+								   GUC_SUPERUSER_ONLY,
+								   NULL, NULL, NULL);
 	}
 
 	DefineCustomEnumVariable("pg_redis.async_full_action",
@@ -274,6 +289,30 @@ _PG_init(void)
 							 PGC_SIGHUP,
 							 0,
 							 NULL, NULL, NULL);
+
+	DefineCustomIntVariable("pg_redis.ring_reclaim_tick_interval",
+							"Dirty-ring drain ticks between stuck-slot reclamation passes.",
+							"The reclaim pass resets slots whose producer ereport'd "
+							"between reserve and publish, unblocking the ring.",
+							&pg_redis_ring_reclaim_tick_interval,
+							1024,
+							1,
+							INT_MAX,
+							PGC_SIGHUP,
+							0,
+							NULL, NULL, NULL);
+
+	DefineCustomIntVariable("pg_redis.ring_slot_stuck_timeout",
+							"Grace period before a dirty-ring slot stuck in the WRITING "
+							"state is reclaimed back to EMPTY.",
+							NULL,
+							&pg_redis_ring_slot_stuck_timeout_ms,
+							5000,
+							100,
+							INT_MAX,
+							PGC_SIGHUP,
+							GUC_UNIT_MS,
+							NULL, NULL, NULL);
 
 	MarkGUCPrefixReserved("pg_redis");
 
@@ -301,6 +340,11 @@ pg_redis_xact_cb(XactEvent event, void *arg)
 static void
 ensure_loaded(void)
 {
+	/* Shared mode: attach to the DSA segment eagerly, before any command
+	 * touches the keyspace (and thus before any partition LWLock is taken).
+	 * pg_redis_shared_palloc/_addr/_pfree assert the segment is attached. */
+	if (pg_redis_storage_is_shared())
+		pg_redis_shmem_attach_dsa();
 	pg_redis_store_init();
 	pg_redis_persistence_init();
 	pg_redis_persistence_load_if_needed();
@@ -1130,22 +1174,28 @@ pg_redis_flushall(PG_FUNCTION_ARGS)
 {
 	if (pg_redis_storage_is_shared())
 	{
-		/* Shared mode: take every partition lock exclusively, blow away the
-		 * shared HTAB, discard pending dirty-ring events, and TRUNCATE the
-		 * durable tables. After release every backend's next access sees
-		 * an empty keyspace and zero pending events. */
+		/* Shared mode (M1, Decision 12). Do only the in-memory keyspace reset
+		 * under all partition locks, then RELEASE every partition lock, and
+		 * only then drop pending ring events and TRUNCATE the durable tables —
+		 * so neither the ring_consumer_lock (taken by drop_all_pending) nor the
+		 * SPI TRUNCATE (and its heavyweight relation locks) runs under a
+		 * partition LWLock. This supersedes harden-shared-memory-error-paths D3
+		 * (which held all partition locks across the TRUNCATE). */
+		pg_redis_shmem_attach_dsa();		/* DSA must be attached before reset */
 		PG_TRY();
 		{
 			pg_redis_shmem_acquire_all_partition_locks_exclusive();
 			(void) pg_redis_shared_store_reset_all();
-			(void) pg_redis_dirty_ring_drop_all_pending();
-			pg_redis_persistence_flushall();
 		}
 		PG_FINALLY();
 		{
 			pg_redis_shmem_release_all_partition_locks();
 		}
 		PG_END_TRY();
+
+		/* No partition lock held now. */
+		(void) pg_redis_dirty_ring_drop_all_pending();
+		pg_redis_persistence_flushall();
 	}
 	else
 	{
@@ -1242,7 +1292,7 @@ pg_redis_bgsave(PG_FUNCTION_ARGS)
 		"VALUES ('snapshot_save', '1 hour'::interval, true, now())";
 
 	ensure_loaded();
-	if (SPI_connect() != SPI_OK_CONNECT)
+	if (pg_redis_spi_connect() != SPI_OK_CONNECT)
 		PG_RETURN_BOOL(false);
 	(void) SPI_execute(sql, false, 0);
 	SPI_finish();
@@ -1266,4 +1316,52 @@ pg_redis_run_job(PG_FUNCTION_ARGS)
 
 	ensure_loaded();
 	PG_RETURN_BOOL(pg_redis_jobs_run_one(job_id));
+}
+
+/* -------------------------------------------------------------------------
+ * Crash-safety diagnostics (Group 12). Used by the invariant regression
+ * tests; also handy for operators investigating the dirty-ring / cold-start
+ * coordination at runtime.
+ * ------------------------------------------------------------------------- */
+
+PG_FUNCTION_INFO_V1(pg_redis_ring_inspect);
+Datum
+pg_redis_ring_inspect(PG_FUNCTION_ARGS)
+{
+	TupleDesc	tupdesc;
+	HeapTuple	tuple;
+	Datum		values[4];
+	bool		nulls[4] = {false, false, false, false};
+	uint64		w = 0,
+				r = 0,
+				pending = 0;
+	int32		stuck = 0;
+
+	pg_redis_dirty_ring_inspect(&w, &r, &pending, &stuck);
+
+	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("function returning record called in context "
+						"that cannot accept type record")));
+	tupdesc = BlessTupleDesc(tupdesc);
+
+	values[0] = Int64GetDatum((int64) w);
+	values[1] = Int64GetDatum((int64) r);
+	values[2] = Int64GetDatum((int64) pending);
+	values[3] = Int32GetDatum(stuck);
+
+	tuple = heap_form_tuple(tupdesc, values, nulls);
+	PG_RETURN_DATUM(HeapTupleGetDatum(tuple));
+}
+
+PG_FUNCTION_INFO_V1(pg_redis_load_state);
+Datum
+pg_redis_load_state(PG_FUNCTION_ARGS)
+{
+	PgRedisSharedHeader *h = pg_redis_shmem_header();
+
+	if (h == NULL)
+		PG_RETURN_NULL();		/* shmem not initialized (session mode) */
+	PG_RETURN_INT32((int32) pg_atomic_read_u32(&h->loaded));
 }

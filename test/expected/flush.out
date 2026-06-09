@@ -50,7 +50,6 @@ SELECT count(*) FROM pgredis.store WHERE key = 'f:rb';     -- 0
 --     => pgredis.hash_fields ends with only f2.
 BEGIN;
 SELECT pgredis."HSET"('f:h', 'f1', 'v1');
-WARNING:  pg_redis: skipping key "f:1": binary tag does not match type 'string'
  HSET 
 ------
  t

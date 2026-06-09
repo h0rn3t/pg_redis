@@ -391,7 +391,7 @@ publish_async_key_upsert(PgRedisEntry *e)
 		body = (const unsigned char *) VARDATA(tlv);
 		body_len = VARSIZE(tlv) - VARHDRSZ;
 		pg_redis_event_encode_key_upsert(&ev, e, body, body_len);
-		pg_redis_dirty_ring_publish(&ev);
+		pg_redis_dirty_ring_publish_blocking(&ev);
 		pg_redis_persistence_note_async_publish(1);
 		pfree(tlv);
 	}
@@ -399,7 +399,7 @@ publish_async_key_upsert(PgRedisEntry *e)
 	{
 		/* hash/list parent row: NULL value */
 		pg_redis_event_encode_key_upsert(&ev, e, NULL, 0);
-		pg_redis_dirty_ring_publish(&ev);
+		pg_redis_dirty_ring_publish_blocking(&ev);
 		pg_redis_persistence_note_async_publish(1);
 	}
 }
@@ -428,7 +428,7 @@ publish_async_hash_deltas(PgRedisEntry *e)
 												f->field, strlen(f->field),
 												(const unsigned char *) f->value,
 												f->value_len);
-		pg_redis_dirty_ring_publish(&ev);
+		pg_redis_dirty_ring_publish_blocking(&ev);
 		pg_redis_persistence_note_async_publish(1);
 		f->dirty = false;
 	}
@@ -439,7 +439,7 @@ publish_async_hash_deltas(PgRedisEntry *e)
 		pg_redis_event_encode_hash_field_delete(&ev,
 												e->key, keylen,
 												t->field, strlen(t->field));
-		pg_redis_dirty_ring_publish(&ev);
+		pg_redis_dirty_ring_publish_blocking(&ev);
 		pg_redis_persistence_note_async_publish(1);
 		pfree(t->field);
 		pfree(t);
@@ -469,7 +469,7 @@ publish_async_list_deltas(PgRedisEntry *e)
 											   n->ord,
 											   (const unsigned char *) n->value,
 											   n->value_len);
-		pg_redis_dirty_ring_publish(&ev);
+		pg_redis_dirty_ring_publish_blocking(&ev);
 		pg_redis_persistence_note_async_publish(1);
 		n->pending_insert = false;
 	}
@@ -480,7 +480,7 @@ publish_async_list_deltas(PgRedisEntry *e)
 		pg_redis_event_encode_list_item_delete(&ev,
 											   e->key, keylen,
 											   o->ord);
-		pg_redis_dirty_ring_publish(&ev);
+		pg_redis_dirty_ring_publish_blocking(&ev);
 		pg_redis_persistence_note_async_publish(1);
 		pfree(o);
 	}
@@ -543,7 +543,7 @@ pg_redis_mark_deleted(const char *key)
 		PgRedisDirtyEvent ev;
 
 		pg_redis_event_encode_key_delete(&ev, key, strlen(key));
-		pg_redis_dirty_ring_publish(&ev);
+		pg_redis_dirty_ring_publish_blocking(&ev);
 		pg_redis_persistence_note_async_publish(1);
 		return;
 	}

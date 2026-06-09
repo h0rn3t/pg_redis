@@ -615,6 +615,49 @@ fill_event_entry(PgRedisEntry *out,
 	out->version = se->version;
 }
 
+/* Free an un-published event's DSA spill payload. Used on the ring-full retry
+ * path so re-encoding on the next attempt doesn't leak the prior spill. */
+static void
+free_event_spill(PgRedisDirtyEvent *ev)
+{
+	if (ev->dsa_overflow && ev->dsa_payload != InvalidDsaPointer)
+	{
+		pg_redis_shared_pfree(ev->dsa_payload);
+		ev->dsa_payload = InvalidDsaPointer;
+		ev->dsa_overflow = 0;
+	}
+}
+
+/*
+ * Backpressure handler for the lock-held publishers, invoked AFTER the caller
+ * has released the partition LWLock (Decision 2 / Group 5). With no pg_redis
+ * LWLock held it is safe to drain synchronously. Returns so the caller retries
+ * the whole mutation under a freshly re-acquired lock (which re-validates the
+ * entry's current state — bug-free per the version/type re-checks at the top of
+ * the retry loop). In 'block' mode it spins up to the budget and then raises
+ * insufficient_resources. The caller MUST NOT hold the partition lock here.
+ */
+static void
+handle_ring_full_after_unlock(int *spin)
+{
+	pg_redis_shmem_wake_bgw();
+
+	if (pg_redis_async_full_action == PG_REDIS_ASYNC_FULL_SYNC_FLUSH)
+	{
+		(void) pg_redis_persistence_sync_drain();
+		*spin = 0;
+		return;
+	}
+
+	if (++(*spin) >= 100)
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_RESOURCES),
+				 errmsg("pg_redis: async dirty-ring is full"),
+				 errhint("Raise pg_redis.dirty_ring_size, or set "
+						 "pg_redis.async_full_action='sync_flush' for inline drain.")));
+	pg_usleep(100);
+}
+
 PgRedisFastHashMutateOutcome
 pg_redis_shared_hash_set_atomic(const char *key, Size keylen,
 								const char *field, Size fieldlen,
@@ -623,83 +666,134 @@ pg_redis_shared_hash_set_atomic(const char *key, Size keylen,
 {
 	HTAB	   *ks = pg_redis_shmem_keyspace();
 	LWLock	   *plock = pg_redis_partition_lock(key, keylen);
-	bool		found;
-	PgRedisSharedEntry *se;
-	bool		was_new = false;
+	int			spin = 0;
 
 	if (ks == NULL || plock == NULL)
 		ereport(ERROR,
 				(errcode(ERRCODE_INTERNAL_ERROR),
 				 errmsg("pg_redis: shared keyspace not initialized")));
 
-	LWLockAcquire(plock, LW_EXCLUSIVE);
-	se = (PgRedisSharedEntry *) hash_search(ks, key, HASH_ENTER, &found);
+	/*
+	 * Retry loop for the sync_flush / block backpressure path. The mutation
+	 * and its persistence-event publish happen atomically under the partition
+	 * lock so per-key write ordering is preserved. If the ring is full we
+	 * release the lock, drain (or spin) with NO pg_redis LWLock held, then
+	 * retry the whole mutation — re-reading the entry re-validates its
+	 * version/type/TTL. Re-applying the HSET is idempotent.
+	 */
+	for (;;)
+	{
+		bool		found;
+		PgRedisSharedEntry *se;
+		bool		was_new = false;
 
-	if (!found)
-	{
-		/* New entry — init as HASH directly. */
-		MemSet(&se->value, 0, sizeof(se->value));
-		se->expire_at = 0;
-		se->has_expire = false;
-		se->version = 0;
-		se->type = PG_REDIS_TYPE_HASH;
-		se->value.scalar.dsa_value = InvalidDsaPointer;
-		se->value.hash.table = InvalidDsaPointer;
-		se->value.hash.field_count = 0;
-		se->value.list.head = InvalidDsaPointer;
-		se->value.list.tail = InvalidDsaPointer;
-	}
-	else if (se->has_expire && GetCurrentTimestamp() >= se->expire_at)
-	{
-		/* TTL-expired — treat as fresh insert. */
-		pg_redis_shared_entry_release_payloads(se);
-		MemSet(&se->value, 0, sizeof(se->value));
-		se->expire_at = 0;
-		se->has_expire = false;
-		se->version = 0;
-		se->type = PG_REDIS_TYPE_HASH;
-		se->value.scalar.dsa_value = InvalidDsaPointer;
-		se->value.hash.table = InvalidDsaPointer;
-		se->value.hash.field_count = 0;
-		se->value.list.head = InvalidDsaPointer;
-		se->value.list.tail = InvalidDsaPointer;
-	}
-	else if (se->type != PG_REDIS_TYPE_HASH)
-	{
-		PgRedisValueType actual = se->type;
+		LWLockAcquire(plock, LW_EXCLUSIVE);
+		se = (PgRedisSharedEntry *) hash_search(ks, key, HASH_ENTER, &found);
 
-		if (out_actual)
-			*out_actual = actual;
+		if (!found)
+		{
+			/* New entry — init as HASH directly. */
+			MemSet(&se->value, 0, sizeof(se->value));
+			se->expire_at = 0;
+			se->has_expire = false;
+			se->version = 0;
+			se->type = PG_REDIS_TYPE_HASH;
+			se->value.scalar.dsa_value = InvalidDsaPointer;
+			se->value.hash.table = InvalidDsaPointer;
+			se->value.hash.field_count = 0;
+			se->value.list.head = InvalidDsaPointer;
+			se->value.list.tail = InvalidDsaPointer;
+		}
+		else if (se->has_expire && GetCurrentTimestamp() >= se->expire_at)
+		{
+			/* TTL-expired — treat as fresh insert. */
+			pg_redis_shared_entry_release_payloads(se);
+			MemSet(&se->value, 0, sizeof(se->value));
+			se->expire_at = 0;
+			se->has_expire = false;
+			se->version = 0;
+			se->type = PG_REDIS_TYPE_HASH;
+			se->value.scalar.dsa_value = InvalidDsaPointer;
+			se->value.hash.table = InvalidDsaPointer;
+			se->value.hash.field_count = 0;
+			se->value.list.head = InvalidDsaPointer;
+			se->value.list.tail = InvalidDsaPointer;
+		}
+		else if (se->type != PG_REDIS_TYPE_HASH)
+		{
+			PgRedisValueType actual = se->type;
+
+			if (out_actual)
+				*out_actual = actual;
+			LWLockRelease(plock);
+			return PG_REDIS_FAST_HASH_MUTATE_WRONGTYPE;
+		}
+
+		pg_redis_shared_hash_set(&se->value.hash.table,
+								 field, fieldlen,
+								 value, value_len,
+								 &was_new);
+		if (was_new)
+			se->value.hash.field_count++;
+		se->version++;
+
+		if (pg_redis_effective_persistence_mode() == PG_REDIS_PERSIST_ASYNC_TABLE)
+		{
+			PgRedisEntry stub;
+			PgRedisDirtyEvent ev;
+
+			/* Parent-row upsert (NULL value for a hash — never spills). */
+			fill_event_entry(&stub, se, key, keylen);
+			pg_redis_event_encode_key_upsert(&ev, &stub, NULL, 0);
+			if (pg_redis_dirty_ring_publish(&ev) == PG_REDIS_RING_FULL)
+			{
+				/* may release and re-acquire the partition lock */
+				free_event_spill(&ev);
+				LWLockRelease(plock);
+				handle_ring_full_after_unlock(&spin);
+				continue;
+			}
+
+			/* Field-value upsert (may spill to DSA for large values). */
+			pg_redis_event_encode_hash_field_upsert(&ev, key, keylen,
+													field, fieldlen,
+													value, value_len);
+			if (pg_redis_dirty_ring_publish(&ev) == PG_REDIS_RING_FULL)
+			{
+				/* may release and re-acquire the partition lock. The parent
+				 * upsert already landed; re-publishing it on retry is harmless
+				 * (the drain dedupes/ON CONFLICTs). */
+				free_event_spill(&ev);
+				LWLockRelease(plock);
+				handle_ring_full_after_unlock(&spin);
+				continue;
+			}
+			pg_redis_persistence_note_async_publish(2);
+		}
+
 		LWLockRelease(plock);
-		return PG_REDIS_FAST_HASH_MUTATE_WRONGTYPE;
+		return was_new ? PG_REDIS_FAST_HASH_MUTATE_OK_NEW
+			: PG_REDIS_FAST_HASH_MUTATE_OK_OVERWRITE;
 	}
+}
 
-	pg_redis_shared_hash_set(&se->value.hash.table,
-							 field, fieldlen,
-							 value, value_len,
-							 &was_new);
-	if (was_new)
-		se->value.hash.field_count++;
-	se->version++;
-
-	if (pg_redis_effective_persistence_mode() == PG_REDIS_PERSIST_ASYNC_TABLE)
+/* Publish an event whose content is independent of the entry's current state
+ * (e.g. a field_delete keyed only on key+field, with no DSA spill). On a full
+ * ring, release the partition lock, drain/spin with no pg_redis LWLock held,
+ * re-acquire, and retry the publish. Re-acquiring before each publish keeps the
+ * out-of-order window (vs. a concurrent same-key write during the drain) as
+ * small as possible. Used by HDEL, where re-running the mutation on retry would
+ * observe the already-applied removal and wrongly report NOOP. */
+static void
+publish_event_under_lock(PgRedisDirtyEvent *ev, LWLock *plock, int *spin)
+{
+	while (pg_redis_dirty_ring_publish(ev) == PG_REDIS_RING_FULL)
 	{
-		PgRedisEntry stub;
-		PgRedisDirtyEvent ev;
-
-		fill_event_entry(&stub, se, key, keylen);
-		pg_redis_event_encode_key_upsert(&ev, &stub, NULL, 0);
-		pg_redis_dirty_ring_publish(&ev);
-		pg_redis_event_encode_hash_field_upsert(&ev, key, keylen,
-												field, fieldlen,
-												value, value_len);
-		pg_redis_dirty_ring_publish(&ev);
-		pg_redis_persistence_note_async_publish(2);
+		/* may release and re-acquire the partition lock */
+		LWLockRelease(plock);
+		handle_ring_full_after_unlock(spin);
+		LWLockAcquire(plock, LW_EXCLUSIVE);
 	}
-
-	LWLockRelease(plock);
-	return was_new ? PG_REDIS_FAST_HASH_MUTATE_OK_NEW
-		: PG_REDIS_FAST_HASH_MUTATE_OK_OVERWRITE;
 }
 
 PgRedisFastHashMutateOutcome
@@ -712,6 +806,7 @@ pg_redis_shared_hash_del_atomic(const char *key, Size keylen,
 	bool		found;
 	PgRedisSharedEntry *se;
 	bool		removed;
+	int			spin = 0;
 
 	if (ks == NULL || plock == NULL)
 		return PG_REDIS_FAST_HASH_MUTATE_NOOP;
@@ -754,8 +849,10 @@ pg_redis_shared_hash_del_atomic(const char *key, Size keylen,
 	{
 		PgRedisDirtyEvent ev;
 
+		/* field_delete carries no value, so it never spills to DSA — safe to
+		 * publish via the re-acquiring retry loop. */
 		pg_redis_event_encode_hash_field_delete(&ev, key, keylen, field, fieldlen);
-		pg_redis_dirty_ring_publish(&ev);
+		publish_event_under_lock(&ev, plock, &spin);
 		pg_redis_persistence_note_async_publish(1);
 	}
 

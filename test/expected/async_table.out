@@ -51,7 +51,6 @@ SELECT count(*) FROM pgredis.store WHERE key = 'a:rb';     -- 0
 -- when the new value is async_table).
 SET pg_redis.persistence_mode = 'sync_table';
 SELECT pgredis."SET"('a:2', 'v');
-WARNING:  pg_redis: skipping key "a:1": binary tag does not match type 'string'
  SET 
 -----
  t

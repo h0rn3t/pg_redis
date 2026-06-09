@@ -72,7 +72,12 @@ pg_redis_bgworker_register(void)
 	MemSet(&w, 0, sizeof(w));
 	w.bgw_flags = BGWORKER_SHMEM_ACCESS | BGWORKER_BACKEND_DATABASE_CONNECTION;
 	w.bgw_start_time = BgWorkerStart_RecoveryFinished;
-	w.bgw_restart_time = 10;
+	/* BGW_NEVER_RESTART: if the configured pg_redis.bgworker_database does not
+	 * exist, BackgroundWorkerInitializeConnection raises FATAL. With a finite
+	 * restart time the postmaster would relaunch it on a loop, the dirty-ring
+	 * would fill, and every producer would error. Never auto-restarting breaks
+	 * that loop; operators fix the GUC and restart the cluster. (Decision 8.) */
+	w.bgw_restart_time = BGW_NEVER_RESTART;
 	snprintf(w.bgw_library_name, BGW_MAXLEN, "pg_redis");
 	snprintf(w.bgw_function_name, BGW_MAXLEN, "pg_redis_bgworker_main");
 	snprintf(w.bgw_name, BGW_MAXLEN, "pg_redis bgworker");
@@ -90,9 +95,29 @@ pg_redis_bgworker_main(Datum main_arg)
 	pqsignal(SIGHUP, pg_redis_bgworker_sighup);
 	BackgroundWorkerUnblockSignals();
 
-	/* Connect to a database so SPI works. We use "postgres" by convention
-	 * and document that operators should grant pg_redis access there. */
-	BackgroundWorkerInitializeConnection("postgres", NULL, 0);
+	/* Connect to a database so SPI works. The target is configurable via
+	 * pg_redis.bgworker_database (default "postgres"). If that database does
+	 * not exist, BackgroundWorkerInitializeConnection raises FATAL and — because
+	 * we registered with BGW_NEVER_RESTART — the worker exits without looping.
+	 * Log the target + GUC first so a missing-database FATAL is diagnosable. */
+	{
+		const char *dbname = (pg_redis_bgworker_database != NULL &&
+							   pg_redis_bgworker_database[0] != '\0')
+			? pg_redis_bgworker_database : "postgres";
+
+		ereport(LOG,
+				(errmsg("pg_redis bgworker connecting to database \"%s\"", dbname),
+				 errdetail("Target database is configured via the "
+						   "pg_redis.bgworker_database GUC. If it does not exist "
+						   "the worker exits and does not restart.")));
+		BackgroundWorkerInitializeConnection(dbname, NULL, 0);
+	}
+
+	/* Attach to the shared DSA segment before the drain loop: the drain frees
+	 * DSA spill payloads via pg_redis_shared_pfree, which asserts the segment
+	 * is attached. Done here (no pg_redis LWLock held) per the eager-attach
+	 * contract. */
+	pg_redis_shmem_attach_dsa();
 
 	/* Publish our latch into shared memory so producers can wake us when
 	 * the dirty-ring fills up. */
@@ -103,6 +128,7 @@ pg_redis_bgworker_main(Datum main_arg)
 
 	{
 		TimestampTz last_drain = GetCurrentTimestamp();
+		uint64		reclaim_tick = 0;
 
 		while (!got_sigterm)
 		{
@@ -171,6 +197,13 @@ pg_redis_bgworker_main(Datum main_arg)
 				CommitTransactionCommand();
 				last_drain = GetCurrentTimestamp();
 			}
+
+			/* Periodic reclamation pass: reset dirty-ring slots whose producer
+			 * ereport'd between reserving and publishing (stuck in WRITING),
+			 * unblocking the ring. Pure shmem work — no transaction needed. */
+			if (pg_redis_ring_reclaim_tick_interval > 0 &&
+				++reclaim_tick % (uint64) pg_redis_ring_reclaim_tick_interval == 0)
+				(void) pg_redis_dirty_ring_reclaim_stuck();
 
 			tick_seconds = pg_redis_flush_interval_s;
 			if (tick_seconds <= 0)

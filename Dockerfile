@@ -10,7 +10,8 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/*
 WORKDIR /build
 COPY Makefile pg_redis.control \
-     pg_redis--1.0.sql pg_redis--1.0--1.1.sql pg_redis--1.1.sql ./
+     pg_redis--1.0.sql pg_redis--1.0--1.1.sql pg_redis--1.1.sql \
+     pg_redis--1.1--1.2.sql pg_redis--1.2.sql ./
 COPY src/ ./src/
 COPY test/ ./test/
 RUN make clean >/dev/null 2>&1 || true \
@@ -43,3 +44,7 @@ COPY --from=builder /usr/share/postgresql/${PG_VERSION}/extension/pg_redis--1.0-
                     /usr/share/postgresql/${PG_VERSION}/extension/pg_redis--1.0--1.1.sql
 COPY --from=builder /usr/share/postgresql/${PG_VERSION}/extension/pg_redis--1.1.sql \
                     /usr/share/postgresql/${PG_VERSION}/extension/pg_redis--1.1.sql
+COPY --from=builder /usr/share/postgresql/${PG_VERSION}/extension/pg_redis--1.1--1.2.sql \
+                    /usr/share/postgresql/${PG_VERSION}/extension/pg_redis--1.1--1.2.sql
+COPY --from=builder /usr/share/postgresql/${PG_VERSION}/extension/pg_redis--1.2.sql \
+                    /usr/share/postgresql/${PG_VERSION}/extension/pg_redis--1.2.sql

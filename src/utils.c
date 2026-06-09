@@ -1,5 +1,6 @@
 #include "postgres.h"
 #include "varatt.h"
+#include "executor/spi.h"
 #include "utils/memutils.h"
 #include "utils/builtins.h"
 #include "fmgr.h"
@@ -14,6 +15,21 @@
 #include "shmem.h"
 
 static MemoryContext PgRedisMemoryContext = NULL;
+
+/*
+ * SPI_connect wrapper that asserts (debug-only) the no-SPI-under-LWLock
+ * invariant: SPI internally waits on catalog/buffer LWLocks and takes
+ * heavyweight relation locks, which must never happen while a pg_redis LWLock
+ * is held. Routing pg_redis's SPI_connect calls through here catches a
+ * regression at the connect, not later as a deadlock under load. Returns
+ * exactly what SPI_connect returns.
+ */
+int
+pg_redis_spi_connect(void)
+{
+	pg_redis_assert_no_pg_redis_lwlock_held();
+	return SPI_connect();
+}
 
 MemoryContext
 pg_redis_memcxt(void)

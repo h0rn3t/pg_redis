@@ -1,9 +1,12 @@
 #include "postgres.h"
 #include "fmgr.h"
+#include "miscadmin.h"
 #include "access/xact.h"
 #include "catalog/pg_type.h"
 #include "executor/spi.h"
 #include "lib/stringinfo.h"
+#include "storage/latch.h"
+#include "storage/lwlock.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/json.h"
@@ -11,6 +14,7 @@
 #include "utils/memutils.h"
 #include "utils/snapmgr.h"
 #include "utils/timestamp.h"
+#include "utils/wait_event.h"
 #include "utils/hsearch.h"
 
 #include <string.h>
@@ -336,7 +340,7 @@ run_flush(void)
 	 * duration of the flush, then pop it. */
 	PushActiveSnapshot(GetTransactionSnapshot());
 
-	if (SPI_connect() != SPI_OK_CONNECT)
+	if (pg_redis_spi_connect() != SPI_OK_CONNECT)
 	{
 		PopActiveSnapshot();
 		ereport(ERROR,
@@ -745,7 +749,12 @@ load_strings_and_ints(void)
 		}
 
 		d = SPI_getbinval(tup, td, 3, &isnull);
-		raw = isnull ? NULL : DatumGetByteaPP(d);
+		/* PG_DETOAST_DATUM (not the "packed" DatumGetByteaPP) so inline-
+		 * compressed values are decompressed before the TLV decoder sees them;
+		 * otherwise pg_redis_decode_* would read PGLZ bytes, fail the tag check,
+		 * and silently drop the value. The detoasted copy lives in
+		 * CurrentMemoryContext and is freed at SPI_finish / statement end. */
+		raw = isnull ? NULL : (bytea *) PG_DETOAST_DATUM(d);
 
 		e = pg_redis_store_upsert(key, &is_new);
 
@@ -847,7 +856,12 @@ load_hashes(void)
 			continue;
 
 		d = SPI_getbinval(tup, td, 3, &isnull);
-		raw = isnull ? NULL : DatumGetByteaPP(d);
+		/* PG_DETOAST_DATUM (not the "packed" DatumGetByteaPP) so inline-
+		 * compressed values are decompressed before the TLV decoder sees them;
+		 * otherwise pg_redis_decode_* would read PGLZ bytes, fail the tag check,
+		 * and silently drop the value. The detoasted copy lives in
+		 * CurrentMemoryContext and is freed at SPI_finish / statement end. */
+		raw = isnull ? NULL : (bytea *) PG_DETOAST_DATUM(d);
 		vbytes = (raw != NULL) ? VARDATA_ANY(raw) : NULL;
 		vlen = (raw != NULL) ? VARSIZE_ANY_EXHDR(raw) : 0;
 
@@ -928,7 +942,12 @@ load_lists(void)
 		ord = DatumGetInt64(d);
 
 		d = SPI_getbinval(tup, td, 3, &isnull);
-		raw = isnull ? NULL : DatumGetByteaPP(d);
+		/* PG_DETOAST_DATUM (not the "packed" DatumGetByteaPP) so inline-
+		 * compressed values are decompressed before the TLV decoder sees them;
+		 * otherwise pg_redis_decode_* would read PGLZ bytes, fail the tag check,
+		 * and silently drop the value. The detoasted copy lives in
+		 * CurrentMemoryContext and is freed at SPI_finish / statement end. */
+		raw = isnull ? NULL : (bytea *) PG_DETOAST_DATUM(d);
 		vbytes = (raw != NULL) ? VARDATA_ANY(raw) : NULL;
 		vlen = (raw != NULL) ? VARSIZE_ANY_EXHDR(raw) : 0;
 
@@ -970,13 +989,44 @@ load_lists(void)
 	}
 }
 
+/* Watchdog: how long the `loading` (state 1) phase may run before another
+ * backend is allowed to steal it (CAS 1->0) and retry — covers the case where
+ * the loader died between writing 1 and 2. */
+#define PG_REDIS_LOAD_WATCHDOG_MS 30000
+
+/* Run the SPI-bearing cold-start load: connect, repopulate strings/ints,
+ * hashes and lists, finish. Caller MUST NOT hold any pg_redis LWLock. SPI
+ * relies on the calling statement's active snapshot (every SQL entry point
+ * has one). Re-throws on error after closing the SPI session. */
+static void
+pg_redis_persistence_do_load(void)
+{
+	if (pg_redis_spi_connect() != SPI_OK_CONNECT)
+		ereport(ERROR,
+				(errcode(ERRCODE_INTERNAL_ERROR),
+				 errmsg("pg_redis: SPI_connect failed in cold-start load")));
+
+	PG_TRY();
+	{
+		load_strings_and_ints();
+		load_hashes();
+		load_lists();
+	}
+	PG_CATCH();
+	{
+		SPI_finish();
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+
+	SPI_finish();
+}
+
 void
 pg_redis_persistence_load_if_needed(void)
 {
 	PgRedisPersistenceMode m;
 	PgRedisSharedHeader *h;
-	bool		shared_mode;
-	bool		need_load = true;
 
 	if (persistence_loaded)
 		return;
@@ -990,63 +1040,92 @@ pg_redis_persistence_load_if_needed(void)
 		return;
 	}
 
-	shared_mode = pg_redis_storage_is_shared();
 	h = pg_redis_shmem_header();
 
-	/* Shared mode: gate on the cluster-wide loaded flag. The first backend to
-	 * touch the keyspace performs the load under startup_lock; subsequent
-	 * backends short-circuit. The per-backend `persistence_loaded` flag is
-	 * kept as a fast-path cache so we don't take the lock on every command. */
-	if (shared_mode && h != NULL)
+	/* Session mode (or shmem uninitialized): load directly, no cross-backend
+	 * coordination needed. */
+	if (!pg_redis_storage_is_shared() || h == NULL)
 	{
-		if (pg_atomic_read_u32(&h->loaded) != 0)
+		pg_redis_persistence_do_load();
+		persistence_loaded = true;
+		return;
+	}
+
+	/*
+	 * Shared mode: coordinate the cold-start load across concurrent backends
+	 * via the `loaded` atomic state machine (0 = unloaded, 1 = loading,
+	 * 2 = loaded). The winner of the CAS 0->1 runs the SPI load with NO
+	 * pg_redis LWLock held; the others poll via WaitLatch until they observe
+	 * 2. This replaces the old "hold startup_lock across SPI" pattern, which
+	 * violated the no-SPI-under-LWLock invariant and deadlocked under
+	 * concurrent cold-start load.
+	 */
+	for (;;)
+	{
+		uint32		state = pg_atomic_read_u32(&h->loaded);
+		uint32		expected;
+
+		if (state == 2)
 		{
 			persistence_loaded = true;
 			return;
 		}
 
-		LWLockAcquire(h->startup_lock, LW_EXCLUSIVE);
-		if (pg_atomic_read_u32(&h->loaded) != 0)
+		if (state == 0)
 		{
-			/* Lost the race — another backend loaded it first. */
-			need_load = false;
+			/* Try to become the loader. */
+			expected = 0;
+			if (pg_atomic_compare_exchange_u32(&h->loaded, &expected, 1))
+			{
+				pg_atomic_write_u64(&h->last_load_attempt,
+									(uint64) GetCurrentTimestamp());
+				PG_TRY();
+				{
+					pg_redis_persistence_do_load();
+				}
+				PG_CATCH();
+				{
+					/* Load failed — reset to unloaded so another backend can
+					 * retry instead of spinning on `loading` forever. */
+					pg_atomic_write_u32(&h->loaded, 0);
+					PG_RE_THROW();
+				}
+				PG_END_TRY();
+
+				pg_atomic_write_u32(&h->loaded, 2);
+				persistence_loaded = true;
+				return;
+			}
+			/* Lost the CAS; re-read state. */
+			continue;
+		}
+
+		/* state == 1: another backend is loading. */
+		{
+			TimestampTz attempt =
+				(TimestampTz) pg_atomic_read_u64(&h->last_load_attempt);
+
+			/* Watchdog: if `loading` has been stuck past the timeout (loader
+			 * likely died), steal it and become the loader on the next pass. */
+			if (attempt != 0 &&
+				TimestampDifferenceExceeds(attempt, GetCurrentTimestamp(),
+										   PG_REDIS_LOAD_WATCHDOG_MS))
+			{
+				expected = 1;
+				if (pg_atomic_compare_exchange_u32(&h->loaded, &expected, 0))
+					continue;
+			}
+
+			/* Poll: 10ms tick, honor cancellation and statement timeout. No
+			 * pg_redis LWLock is held while we wait. */
+			(void) WaitLatch(MyLatch,
+							 WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
+							 10L,
+							 PG_WAIT_EXTENSION);
+			ResetLatch(MyLatch);
+			CHECK_FOR_INTERRUPTS();
 		}
 	}
-
-	if (need_load)
-	{
-		if (SPI_connect() != SPI_OK_CONNECT)
-		{
-			if (shared_mode && h != NULL)
-				LWLockRelease(h->startup_lock);
-			return;				/* best-effort; mark loaded only on success */
-		}
-
-		PG_TRY();
-		{
-			load_strings_and_ints();
-			load_hashes();
-			load_lists();
-		}
-		PG_CATCH();
-		{
-			SPI_finish();
-			if (shared_mode && h != NULL)
-				LWLockRelease(h->startup_lock);
-			PG_RE_THROW();
-		}
-		PG_END_TRY();
-
-		SPI_finish();
-
-		if (shared_mode && h != NULL)
-			pg_atomic_write_u32(&h->loaded, 1);
-	}
-
-	if (shared_mode && h != NULL)
-		LWLockRelease(h->startup_lock);
-
-	persistence_loaded = true;
 }
 
 /* -------------------------------------------------------------------------
@@ -1171,7 +1250,7 @@ pg_redis_persistence_save_snapshot(void)
 	values[0] = Int64GetDatum(count);
 	values[1] = CStringGetTextDatum(json.data);
 
-	if (SPI_connect() != SPI_OK_CONNECT)
+	if (pg_redis_spi_connect() != SPI_OK_CONNECT)
 	{
 		pfree(json.data);
 		pfree(DatumGetPointer(values[1]));
@@ -1228,6 +1307,9 @@ pg_redis_persistence_async_drain(int max_events)
 	PgRedisDirtyEvent *events;
 	int			n;
 	int			batch_max;
+	uint64		base = 0;
+	bool		spi_connected = false;
+	bool		snapshot_pushed = false;
 	DatumVec	store_keys,
 				store_types,
 				store_values,
@@ -1253,7 +1335,11 @@ pg_redis_persistence_async_drain(int max_events)
 		batch_max = ASYNC_DRAIN_BATCH_MAX;
 
 	events = (PgRedisDirtyEvent *) palloc(sizeof(PgRedisDirtyEvent) * batch_max);
-	n = pg_redis_dirty_ring_drain(events, batch_max);
+
+	/* Phase 1 (collect): under ring_consumer_lock, copy a batch and flip its
+	 * slots READY -> DRAINING. read_head is NOT advanced and nothing is freed
+	 * yet — that waits for the durable write to succeed (Decision 11). */
+	n = pg_redis_dirty_ring_collect(events, batch_max, &base);
 	if (n == 0)
 	{
 		pfree(events);
@@ -1261,30 +1347,26 @@ pg_redis_persistence_async_drain(int max_events)
 	}
 
 	PushActiveSnapshot(GetTransactionSnapshot());
+	snapshot_pushed = true;
 
-	if (SPI_connect() != SPI_OK_CONNECT)
+	if (pg_redis_spi_connect() != SPI_OK_CONNECT)
 	{
-		/* Drained events own DSA-spill payloads — release before raising so
-		 * SPI_connect failure doesn't leak shared memory. */
-		for (int i = 0; i < n; i++)
-		{
-			if (events[i].dsa_overflow)
-			{
-				pg_redis_shared_pfree(events[i].dsa_payload);
-				events[i].dsa_payload = InvalidDsaPointer;
-				events[i].dsa_overflow = 0;
-			}
-		}
+		/* Couldn't open SPI. Return the collected batch to the ring (slots back
+		 * to READY, read_head unchanged) so a later drain retries it
+		 * (at-least-once), then raise. */
 		PopActiveSnapshot();
+		snapshot_pushed = false;
+		pg_redis_dirty_ring_abort_batch(events, base, n);
 		pfree(events);
 		ereport(ERROR,
 				(errcode(ERRCODE_INTERNAL_ERROR),
 				 errmsg("pg_redis: SPI_connect failed in async drain")));
 	}
+	spi_connected = true;
 
-	/* From here on, an ereport in SPI execution would leak the spill payloads
-	 * attached to drained events — guard with PG_TRY so PG_CATCH frees them
-	 * before propagating. */
+	/* Phase 2 (persist). On any error the PG_CATCH below pops the snapshot,
+	 * finishes SPI (idempotently), and resets the batch's slots to READY so
+	 * the events stay in the ring. */
 	PG_TRY();
 	{
 	vec_init(&store_keys);
@@ -1514,39 +1596,40 @@ pg_redis_persistence_async_drain(int max_events)
 	}
 
 	SPI_finish();
+	spi_connected = false;
 	PopActiveSnapshot();
+	snapshot_pushed = false;
 	}
 	PG_CATCH();
 	{
-		/* Always release drained spill payloads — they're unreferenced from
-		 * the ring now, so leaving them allocated would leak DSA forever. */
-		for (int i = 0; i < n; i++)
+		/* Idempotent cleanup (Group 9): pop the active snapshot and finish the
+		 * SPI session if they are still open, in that order, before returning
+		 * the batch to the ring. Tracking the two flags keeps repeated drain
+		 * failures from deepening the SPI nesting or leaking snapshots. */
+		if (snapshot_pushed)
 		{
-			if (events[i].dsa_overflow)
-			{
-				pg_redis_shared_pfree(events[i].dsa_payload);
-				events[i].dsa_payload = InvalidDsaPointer;
-				events[i].dsa_overflow = 0;
-			}
+			PopActiveSnapshot();
+			snapshot_pushed = false;
 		}
+		if (spi_connected)
+		{
+			SPI_finish();
+			spi_connected = false;
+		}
+		/* Phase 3 (failure): leave read_head unchanged and reset the batch's
+		 * slots to READY so the events are re-collected and re-persisted by a
+		 * later drain (at-least-once). The DSA spill payloads stay owned by the
+		 * slots — do NOT free them here. */
+		pg_redis_dirty_ring_abort_batch(events, base, n);
 		pfree(events);
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
 
-	/* Free DSA-spilled payloads. Inline events use the event slot's own
-	 * inline_bytes; only spilled events have a separate DSA allocation that
-	 * needs explicit release. */
-	for (int i = 0; i < n; i++)
-	{
-		if (events[i].dsa_overflow)
-		{
-			pg_redis_shared_pfree(events[i].dsa_payload);
-			events[i].dsa_payload = InvalidDsaPointer;
-			events[i].dsa_overflow = 0;
-		}
-	}
-
+	/* Phase 3 (success): the durable write executed. Advance read_head past the
+	 * batch, flip its slots to EMPTY, and free each event's DSA spill payload
+	 * exactly once. */
+	pg_redis_dirty_ring_release_batch(events, base, n);
 	pfree(events);
 	return n;
 }
@@ -1575,6 +1658,11 @@ int
 pg_redis_persistence_sync_drain(void)
 {
 	int			drained;
+
+	/* The sync_flush producer MUST release its partition LWLock before calling
+	 * us (Decision 2): the drain opens a subtransaction and runs SPI, which is
+	 * forbidden under any pg_redis LWLock. */
+	pg_redis_assert_no_pg_redis_lwlock_held();
 
 	if (IsTransactionState())
 	{
@@ -1616,9 +1704,14 @@ pg_redis_persistence_sync_drain(void)
 void
 pg_redis_persistence_flushall(void)
 {
+	/* M1 (Decision 12): the TRUNCATE (SPI + heavyweight relation locks) MUST
+	 * run with no pg_redis LWLock held. pg_redis_flushall() releases all
+	 * partition locks before calling us. */
+	pg_redis_assert_no_pg_redis_lwlock_held();
+
 	if (persistence_writes_enabled())
 	{
-		if (SPI_connect() == SPI_OK_CONNECT)
+		if (pg_redis_spi_connect() == SPI_OK_CONNECT)
 		{
 			(void) SPI_execute("TRUNCATE TABLE pgredis.store CASCADE", false, 0);
 			SPI_finish();
@@ -1627,14 +1720,14 @@ pg_redis_persistence_flushall(void)
 	persistence_loaded = true;
 
 	/* Shared mode: the keyspace is now authoritative-empty across the
-	 * cluster. Mark the shared loaded flag so other backends don't try to
-	 * re-load from the (now empty) durable tables. */
+	 * cluster. Mark the shared loaded flag (2 = loaded) so other backends
+	 * don't try to re-load from the (now empty) durable tables. */
 	if (pg_redis_storage_is_shared())
 	{
 		PgRedisSharedHeader *h = pg_redis_shmem_header();
 
 		if (h != NULL)
-			pg_atomic_write_u32(&h->loaded, 1);
+			pg_atomic_write_u32(&h->loaded, 2);
 	}
 }
 
@@ -1665,7 +1758,7 @@ pg_redis_persistence_append_aof(const char *op, const char *key,
 	}
 	values[2] = CStringGetTextDatum(args_json != NULL ? args_json : "{}");
 
-	if (SPI_connect() != SPI_OK_CONNECT)
+	if (pg_redis_spi_connect() != SPI_OK_CONNECT)
 		return;
 	(void) SPI_execute_with_args(sql, 3, argtypes, values, nulls, false, 0);
 	SPI_finish();
