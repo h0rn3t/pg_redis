@@ -31,11 +31,21 @@ typedef struct PgRedisSharedHeader
 
 	/* --- v1.2 shared keyspace + async-table additions --- */
 
-	/* Serializes the cold-start load from durable tables into the shared
-	 * HTAB. Acquired exclusively by the first backend that touches the
-	 * keyspace after postmaster start. */
+	/* Brief, non-SPI critical sections only (e.g. publishing the DSA handle
+	 * after dsa_create). MUST NOT be held across any SPI call — the cold-start
+	 * load is coordinated by the `loaded` atomic state machine below, not by
+	 * this lock. */
 	LWLock	   *startup_lock;
-	pg_atomic_uint32 loaded;	/* 0 = not loaded, 1 = loaded */
+
+	/* Cold-start load coordination. 0 = unloaded, 1 = loading (one backend is
+	 * running the SPI load with NO pg_redis LWLock held), 2 = loaded. Backends
+	 * CAS 0->1 to become the loader; others poll via WaitLatch until 2. */
+	pg_atomic_uint32 loaded;
+
+	/* TimestampTz (as raw u64) of the most recent 0->1 transition. The
+	 * watchdog lets a backend steal a `loading` state stuck for >30s (the
+	 * loader died between writing 1 and 2) by CAS'ing 1->0 and retrying. */
+	pg_atomic_uint64 last_load_attempt;
 
 	/* DSA segment backing variable-size payloads. Created at startup hook
 	 * (postmaster context); attached on demand by each backend. */
@@ -53,6 +63,15 @@ typedef struct PgRedisSharedHeader
 	 * sized at `dirty_ring_size` slots. */
 	pg_atomic_uint64 ring_write_head;
 	pg_atomic_uint64 ring_read_head;
+
+	/* Serializes ALL dirty-ring drainers — the BGW and every sync_flush
+	 * producer — so read_head is advanced by at most one drainer at a time and
+	 * slot DRAINING transitions never race. A leaf lock: a sync_flush producer
+	 * releases its partition LWLock before acquiring this (Decision 10), so the
+	 * two are never held together in the drain path and no ordering cycle
+	 * exists. (FLUSHALL's drop-all-pending may acquire it while holding
+	 * partition locks; that partition->consumer nesting has no reverse edge.) */
+	LWLock	   *ring_consumer_lock;
 }			PgRedisSharedHeader;
 
 /* shmem_request_hook entry point — reserves the header, ring, lock array,
@@ -80,12 +99,28 @@ extern PgRedisSharedHeader *pg_redis_shmem_header(void);
  * NULL when shared mode is not initialized. */
 extern HTAB *pg_redis_shmem_keyspace(void);
 
-/* Attach the calling backend to the DSA segment if not already attached, and
- * return the cached `dsa_area *`. NULL if shmem isn't initialized. */
+/* Eagerly create (first backend) or attach (subsequent backends) the shared
+ * DSA segment for this backend. MUST be called once per backend before any
+ * partition LWLock is taken (every SQL entry point routes through
+ * ensure_loaded(); the BGW calls it at startup). Idempotent. No-op in session
+ * mode (shmem not initialized). */
+extern void pg_redis_shmem_attach_dsa(void);
+
+/* Pure accessor: return the calling backend's cached `dsa_area *`, or NULL if
+ * pg_redis_shmem_attach_dsa() has not run yet. Never creates or attaches. */
 extern dsa_area *pg_redis_shmem_dsa(void);
 
 /* Return the LWLock for `hash_any(key, len) % lock_partitions`. */
 extern LWLock *pg_redis_partition_lock(const char *key, Size keylen);
+
+/*
+ * Invariant guard: no pg_redis code path may run SPI, a transaction-state
+ * mutation, dsa_create, blocking I/O, or snapshot-requiring catalog access
+ * while holding ANY pg_redis LWLock (partition, snapshot, startup, or
+ * ring-consumer lock). Call this (debug-only; a no-op in non-assert builds) at
+ * the entry of every SPI-bearing path to catch regressions early.
+ */
+extern void pg_redis_assert_no_pg_redis_lwlock_held(void);
 
 /* Helper: set or clear the BGW latch pointer in the header. Called by the
  * BGW main loop at startup/shutdown. */

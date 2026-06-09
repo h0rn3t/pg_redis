@@ -14,6 +14,11 @@
 #define PG_REDIS_KEY_STACK_BUFSZ   256
 #define PG_REDIS_FIELD_STACK_BUFSZ 256
 
+/* SPI_connect wrapper that asserts no pg_redis LWLock is held (debug-only),
+ * enforcing the no-SPI-under-LWLock invariant. Use in place of SPI_connect()
+ * on every pg_redis SPI path. Returns SPI_connect()'s result verbatim. */
+extern int	pg_redis_spi_connect(void);
+
 /* Get the long-lived MemoryContext used by the key-value store. */
 extern MemoryContext pg_redis_memcxt(void);
 

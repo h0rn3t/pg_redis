@@ -1,340 +1,294 @@
 # pg_redis
 
-`pg_redis` is a PostgreSQL extension written in C that embeds a Redis-like
-in-memory key-value store directly into a PostgreSQL backend, exposed through
-quoted UPPERCASE SQL functions in schema `pgredis`. (The extension binary is
-named `pg_redis`; PostgreSQL reserves the `pg_` schema prefix for system
-catalogs, so the SQL-facing schema is the shortened `pgredis`.)
+`pg_redis` — розширення PostgreSQL, написане на C, що вбудовує Redis-подібне
+сховище ключ-значення в пам'яті безпосередньо у PostgreSQL-бекенд і відкриває
+його через SQL-функції зі схеми `pgredis` у вигляді іменованих лапками
+ПРОПИСНИХ ідентифікаторів. (Бінарний файл розширення називається `pg_redis`;
+PostgreSQL резервує префікс `pg_` для системних каталогів, тому SQL-схема
+скорочена до `pgredis`.)
 
-It is **not** a drop-in Redis replacement. There is no RESP protocol, no
-pub/sub, no streams or sorted sets, and no clustering. What it does provide is
-a small, well-tested Redis-shaped command surface — strings, integers, hashes,
-lists, TTL, snapshots, and a background job scheduler — running inside the
-same process that already serves your SQL queries, with durability riding on
-PostgreSQL's WAL.
+Це **не** повноцінна заміна Redis. Тут немає RESP-протоколу, pub/sub, потоків,
+відсортованих множин і кластеризації. Натомість розширення надає невеликий,
+добре протестований набір Redis-подібних команд — рядки, цілі числа, хеші,
+списки, TTL, знімки та планувальник фонових завдань — що працюють всередині
+того самого процесу, який обслуговує SQL-запити, з довговічністю даних на
+основі WAL PostgreSQL.
 
-## Why you might want it
+## Для чого підходить
 
-- Cut a Redis dependency for caches, counters, ephemeral session state, or
-  lightweight job queues.
-- Keep one connection pool, one backup, one ACL surface.
-- Run inside an existing transaction so that a rollback also rolls back the
-  durable copy of your cache write.
+- Позбутися залежності від Redis для кешів, лічильників, ефемерного стану
+  сесій або легких черг завдань.
+- Мати один пул з'єднань, одне резервне копіювання, одну ACL-поверхню.
+- Виконувати операції всередині поточної транзакції — `ROLLBACK` відкотить
+  також копію запису в кеші.
 
-## Why you might not
+## Для чого не підходить
 
-- You need raw Redis throughput or sub-millisecond replicated clusters.
-- You need pub/sub, streams, sorted sets, scripting, or Redis modules.
-- You need keyspace visible across backends in real time without round-tripping
-  through a table (v0.1 is session-local; see "Concurrency model" below).
+- Потрібна сира пропускна здатність Redis або підмілісекундні реплікаційні
+  кластери.
+- Потрібен pub/sub, потоки, відсортовані множини, скриптинг або Redis-модулі.
+- Потрібна область видимості ключів між бекендами в реальному часі без обходу
+  через таблицю (в v0.1 простір ключів є сесійно-локальним; див. «Модель
+  паралелізму» нижче).
 
-## Features
+## Можливості
 
-- **Types**: `string`, `int`, `hash`, `list`.
-- **Commands**: `SET`, `GET`, `DEL`, `EXISTS`, `EXPIRE`, `TTL`, `INCR`, `DECR`,
+- **Типи**: `string`, `int`, `hash`, `list`.
+- **Команди**: `SET`, `GET`, `DEL`, `EXISTS`, `EXPIRE`, `TTL`, `INCR`, `DECR`,
   `HSET`, `HGET`, `HDEL`, `HEXISTS`, `LPUSH`, `RPUSH`, `LPOP`, `RPOP`, `LLEN`,
   `KEYS`, `FLUSHALL`, `MEMORY_USAGE`, `STATS`, `INFO`, `SAVE`, `BGSAVE`,
   `BGREWRITEAOF`.
-- **Background jobs**: `ADD_FLUSH_POLICY`, `ADD_TTL_CLEANUP_POLICY`,
+- **Фонові завдання**: `ADD_FLUSH_POLICY`, `ADD_TTL_CLEANUP_POLICY`,
   `ADD_SNAPSHOT_POLICY`, `DELETE_JOB`, `RUN_JOB`, `JOBS`, `JOB_STATS`.
-- **Persistence**: in-memory only (`none`), write-through to a logged table
-  (`sync_table` — default), or table-backed snapshots (`SAVE`/`BGSAVE`).
-- **Background worker** that scans `pgredis.jobs` for due jobs and runs them.
+- **Зберігання**: лише в пам'яті (`none`), наскрізний запис у логовану таблицю
+  (`sync_table` — за замовчуванням) або знімки через таблицю (`SAVE`/`BGSAVE`).
+- **Фоновий воркер**, що сканує `pgredis.jobs` і запускає задачі за розкладом.
 
-## Limitations (read before deploying)
+## Обмеження (прочитайте перед розгортанням)
 
-- **Session-local keyspace.** Each PostgreSQL backend has its own copy of the
-  in-memory keyspace. Setting a key in one connection does **not** make it
-  visible in another connection — unless you're in the default `sync_table`
-  mode, in which case the other backend reads the durable row on its first
-  command and lazy-loads it into memory.
-- **No fully shared keyspace yet.** The `pg_redis.storage_mode = 'shared'` GUC
-  is reserved for a future release. v0.1 always behaves as session-local.
-- **`async_table` falls back to `sync_table`** in v0.1. The infrastructure is
-  in place but real async batched flushing requires the shared keyspace.
-- **AOF is scaffolded, not implemented.** `BGREWRITEAOF` returns `false` and
-  raises a `NOTICE`. The `pgredis.aof` table exists for forward compatibility.
-- **Transactions.** Durable rows in `pgredis.store` participate in the calling
-  transaction: a `ROLLBACK` after `SET` removes the row. The in-memory copy
-  is **not** rolled back; instead, the next access in that backend lazy-reloads
-  from the durable table via an `XactCallback`. Cross-session correctness
-  depends on persisting through the table.
+- **Сесійно-локальний простір ключів.** Кожен PostgreSQL-бекенд має власну
+  копію in-memory простору ключів. Встановлення ключа в одному з'єднанні **не**
+  робить його видимим в іншому — якщо тільки ви не в режимі `sync_table`
+  (за замовчуванням), де інший бекенд читає трвалий рядок при першій команді і
+  ліниво завантажує його в пам'ять.
+- **Спільного простору ключів поки немає.** GUC `pg_redis.storage_mode = 'shared'`
+  зарезервовано для майбутнього релізу. v0.1 завжди поводиться як сесійно-локальний.
+- **`async_table` відкочується до `sync_table`** у v0.1. Інфраструктура є, але
+  реальне асинхронне батчове скидання потребує спільного простору ключів.
+- **AOF лише каркас, не реалізований.** `BGREWRITEAOF` повертає `false` та
+  видає `NOTICE`. Таблиця `pgredis.aof` існує для сумісності в майбутньому.
+- **Транзакції.** Тривалі рядки в `pgredis.store` беруть участь у транзакції,
+  що викликає команду: `ROLLBACK` після `SET` видаляє рядок. In-memory копія
+  **не** відкочується; натомість наступний доступ в тому бекенді ліниво
+  перезавантажує дані з трвалої таблиці через `XactCallback`.
 
-## Architecture
+## Архітектура
 
-A short tour of what runs where, what lives in RAM, what lives on disk, and how
-the two stay in sync.
+Короткий огляд того, що де виконується, що зберігається в RAM, що на диску, і
+як вони синхронізуються.
 
-### Process model
+### Модель процесів
 
-`pg_redis` is a shared library loaded into each PostgreSQL backend (the
-process that handles your SQL connection). Every SQL function in `pgredis."…"`
-is a C function exported from that library and runs **inside** the backend
-process — no socket, no protocol layer. PostgreSQL is process-per-connection,
-so:
+`pg_redis` — це динамічна бібліотека, що завантажується в кожен PostgreSQL-бекенд
+(процес, який обслуговує SQL-з'єднання). Кожна SQL-функція в `pgredis."…"` є
+C-функцією з цієї бібліотеки і виконується **всередині** процесу бекенда — без
+сокету, без рівня протоколу. PostgreSQL працює за моделлю «один процес на
+з'єднання», тому:
 
-- Each backend has its **own** copy of the in-memory keyspace.
-- There is no shared keyspace across backends in v0.1; cross-backend visibility
-  goes through the durable table (see "Persistence layer" below).
-- One optional **background worker** (`pg_redis bgworker`) is registered when
-  `shared_preload_libraries = 'pg_redis'`. It runs as a separate process,
-  ticks every `pg_redis.flush_interval` seconds, and dispatches due jobs from
+- Кожен бекенд має **свою** копію in-memory простору ключів.
+- У v0.1 спільного простору між бекендами немає; видимість між сесіями
+  забезпечується через трвалу таблицю (див. «Рівень зберігання» нижче).
+- Один необов'язковий **фоновий воркер** (`pg_redis bgworker`) реєструється при
+  `shared_preload_libraries = 'pg_redis'`. Він виконується як окремий процес,
+  тікає кожні `pg_redis.flush_interval` секунд і відправляє задачі з
   `pgredis.jobs`.
 
-### In-memory keyspace (per backend)
+### In-memory простір ключів (на бекенд)
 
-The hot path lives in a private chunk of the backend's address space and never
-talks to disk:
+Гаряча гілка знаходиться у приватній ділянці адресного простору бекенда і
+ніколи не звертається до диска:
 
 ```text
 TopMemoryContext
-└── PgRedisMemoryContext           ← long-lived, palloc'd values land here
-    └── HTAB "pg_redis_store"      ← dynahash, key (text) → PgRedisEntry
-        └── PgRedisEntry           ← per Redis key
-            ├── key[1025]          ← inline NUL-terminated, fixed-size
+└── PgRedisMemoryContext           ← довгоживучий, значення palloc'уються тут
+    └── HTAB "pg_redis_store"      ← dynahash, ключ (text) → PgRedisEntry
+        └── PgRedisEntry           ← для одного Redis-ключа
+            ├── key[1025]          ← inline NUL-terminated, фіксований розмір
             ├── type               ← STRING | INT | HASH | LIST
             ├── expire_at / has_expire  ← TTL (TimestampTz)
             ├── dirty / deleted / version / memory_usage
             └── value (union)
                 ├── string_value   → char *  (palloc'd, NUL-terminated)
-                ├── int_value      → int64   (inline, no alloc)
-                ├── hash_value     → PgRedisHash { HTAB fields → PgRedisHashField, count, mem }
+                ├── int_value      → int64   (inline, без alloc)
+                ├── hash_value     → PgRedisHash { HTAB полів → PgRedisHashField, count, mem }
                 └── list_value     → PgRedisList { doubly-linked PgRedisListNode head/tail, length, mem }
 ```
 
-Key data structures (see [src/types.h](src/types.h)):
+Ключові структури даних (див. [src/types.h](src/types.h)):
 
-| Structure | Purpose | Where allocated |
+| Структура | Призначення | Де виділяється |
 | --- | --- | --- |
-| `PgRedisEntry` | One Redis key | `dynahash` slot inside `PgRedisMemoryContext` |
-| `PgRedisHash` | Hash container with its own `HTAB` of fields | `PgRedisMemoryContext` |
-| `PgRedisHashField` | One hash field (`field[1025]` inline + `char *value`) | `PgRedisMemoryContext` |
-| `PgRedisList` + `PgRedisListNode` | Doubly-linked list (Redis-style LPUSH/RPUSH at both ends) | `PgRedisMemoryContext` |
+| `PgRedisEntry` | Один Redis-ключ | Слот `dynahash` всередині `PgRedisMemoryContext` |
+| `PgRedisHash` | Контейнер хешу зі своїм `HTAB` полів | `PgRedisMemoryContext` |
+| `PgRedisHashField` | Одне поле хешу (`field[1025]` inline + `char *value`) | `PgRedisMemoryContext` |
+| `PgRedisList` + `PgRedisListNode` | Двозв'язний список (LPUSH/RPUSH з обох кінців) | `PgRedisMemoryContext` |
 
-Notes on the in-memory design:
+Примітки щодо in-memory дизайну:
 
-- The top-level store is PostgreSQL's `dynahash` HTAB (`utils/hsearch.h`),
-  parented to `PgRedisMemoryContext` — see [src/kv_store.c](src/kv_store.c). All allocations for values
-  (strings, list nodes, hash fields) palloc into the same context, so
-  `FLUSHALL` is implemented as a single `MemoryContextReset` + HTAB rebuild.
-- Hash values use a **nested** HTAB per Redis hash key — `O(1)` HGET/HSET
-  regardless of field count.
-- Lists are intrusive doubly-linked nodes with cached `head`, `tail`, and
-  `length`, giving `O(1)` LPUSH/RPUSH/LPOP/RPOP/LLEN.
-- TTL is stored as `TimestampTz` directly on the entry; expiration is
-  **lazy** — checked on each access via `pg_redis_store_lookup()` — plus an
-  optional periodic sweep via the `ttl_cleanup` job.
-- `PgRedisEntry.dirty`, `.deleted`, `.version` exist for the (future)
-  async-flush path; in sync mode the entry is persisted before the function
-  returns and `dirty` is cleared immediately.
+- Верхньорівневе сховище — це PostgreSQL-`dynahash` HTAB (`utils/hsearch.h`),
+  прив'язаний до `PgRedisMemoryContext` (див. [src/kv_store.c](src/kv_store.c)).
+  Усі алокації для значень (рядки, вузли списків, поля хешів) ідуть в той самий
+  контекст, тому `FLUSHALL` реалізований як один `MemoryContextReset` + відбудова HTAB.
+- Значення хешів використовують **вкладений** HTAB для кожного Redis-ключа хешу —
+  `O(1)` HGET/HSET незалежно від кількості полів.
+- Списки — це інтрузивні двозв'язні вузли з кешованими `head`, `tail` і
+  `length`, що дає `O(1)` LPUSH/RPUSH/LPOP/RPOP/LLEN.
+- TTL зберігається як `TimestampTz` безпосередньо на записі; закінчення терміну
+  **ліниве** — перевіряється при кожному доступі через `pg_redis_store_lookup()` —
+  плюс необов'язкове регулярне сканування через задачу `ttl_cleanup`.
+- `PgRedisEntry.dirty`, `.deleted`, `.version` існують для (майбутнього) шляху
+  асинхронного скидання; в режимі sync запис зберігається до повернення функції
+  і `dirty` одразу очищається.
 
-### Persistence layer (durable in PostgreSQL tables)
+### Рівень зберігання (тривале — в таблицях PostgreSQL)
 
-What's persistent and where it lives, all under schema `pgredis`
-(see [pg_redis--1.1.sql](pg_redis--1.1.sql)):
+Що зберігається й де, все під схемою `pgredis`
+(див. [pg_redis--1.1.sql](pg_redis--1.1.sql)):
 
-| Table | Holds | Written by |
+| Таблиця | Містить | Записується |
 | --- | --- | --- |
-| `pgredis.store` | One row per Redis key: `(key, type, value bytea, expire_at, version, updated_at)` plus the PG18 **virtual generated column** `key_bytes`. `value` holds the TLV-encoded string/int payload, or `NULL` for hash/list parents | the batched pre-commit flush in `sync_table` mode, via SPI |
-| `pgredis.hash_fields` | One row per hash field: `(key, field, value bytea)`. FK `key → pgredis.store(key) ON DELETE CASCADE` | per-field upsert/delete at flush; never re-writes untouched fields |
-| `pgredis.list_items` | One row per list element: `(key, ord bigint, value bytea)`. `ord` is a stable monotonic ordinal — LPUSH assigns `min(ord)-1`, RPUSH assigns `max(ord)+1`. FK `key → pgredis.store(key) ON DELETE CASCADE` | per-element insert/delete at flush; never re-writes untouched elements |
-| `pgredis.meta` | Free-form metadata rows (jsonb), reserved | extension internals |
-| `pgredis.jobs` | The job scheduler table | `ADD_*_POLICY`, `DELETE_JOB`, bgworker / `RUN_JOB` |
-| `pgredis.job_stats` | Per-job counters | bgworker and `RUN_JOB` |
-| `pgredis.snapshots` | Point-in-time dump of the keyspace as one `jsonb` payload, time-sortable `uuidv7()` PK | `SAVE` / `BGSAVE` |
-| `pgredis.aof` | Scaffolded append-only log. Not populated in v0.1 | reserved |
+| `pgredis.store` | Один рядок на Redis-ключ: `(key, type, value bytea, expire_at, version, updated_at)` плюс **віртуальний generated column** PG18 `key_bytes`. `value` містить рядок/ціле число у TLV-кодуванні, або `NULL` для батьківських хешів/списків | пакетним скиданням до коміту в режимі `sync_table` через SPI |
+| `pgredis.hash_fields` | Один рядок на поле хешу: `(key, field, value bytea)`. FK `key → pgredis.store(key) ON DELETE CASCADE` | upsert/delete per-field при скиданні |
+| `pgredis.list_items` | Один рядок на елемент списку: `(key, ord bigint, value bytea)`. `ord` — стабільний монотонний порядковий номер | insert/delete per-element при скиданні |
+| `pgredis.meta` | Рядки метаданих у вільній формі (jsonb), зарезервовано | внутрішні потреби розширення |
+| `pgredis.jobs` | Таблиця планувальника завдань | `ADD_*_POLICY`, `DELETE_JOB`, bgworker / `RUN_JOB` |
+| `pgredis.job_stats` | Лічильники на задачу | bgworker та `RUN_JOB` |
+| `pgredis.snapshots` | Точковий дамп простору ключів як `jsonb`, первинний ключ `uuidv7()` | `SAVE` / `BGSAVE` |
+| `pgredis.aof` | Каркас append-only журналу. Не заповнюється в v0.1 | зарезервовано |
 
-How a value becomes a row:
+Записи ніколи не потрапляють на диск синхронно на кожну команду. Мутатори
+(`SET`/`INCR`/`HSET`/`LPUSH`/…) позначають запис у per-backend **dirty-set**
+і ставлять у чергу томбстони для `DEL` / TTL-виселення в список
+`pending_deletes`. При `XACT_EVENT_PRE_COMMIT` транзакції користувача dirty-set
+спустошується в **одній SPI-сесії** через шість кешованих планів `SPI_keepplan`,
+параметризованих масивами через `unnest()`, щоб весь батч — рядки store,
+поля hash, елементи list — скинувся максимум за шість викликів
+`SPI_execute_plan` (див. [src/persistence.c](src/persistence.c) `run_flush`).
 
-- **Strings / ints** are stored in `pgredis.store.value` as a compact binary
-  TLV: `[u8 tag][u32 length_le][payload]` (tag `0x01` for string, `0x02` for
-  int — see `PG_REDIS_TLV_*` in [src/types.h](src/types.h),
-  [src/binval.c](src/binval.c)). No JSON cast on the hot path.
-- **Hashes** persist one row per field in `pgredis.hash_fields`; the parent
-  row in `pgredis.store` carries `type='hash'` and `value IS NULL`. A single
-  `HSET` produces a single row write, regardless of how many other fields the
-  hash already has.
-- **Lists** persist one row per element in `pgredis.list_items` with a stable
-  `bigint` ordinal. LPUSH/RPUSH/LPOP/RPOP touch the boundary row only; the
-  rest of the list is never re-written. On load, min/max ords are recomputed
-  per list to anchor future pushes.
-- **TTL** lives in `expire_at`. The partial index
-  `store_expire_at_idx WHERE expire_at IS NOT NULL` keeps the sweep query
-  fast even when most keys have no TTL.
-- All `pgredis.*` tables are registered with `pg_extension_config_dump`, so
-  `pg_dump` includes the rows.
+### Інтеграція з транзакціями
 
-Writes never go to disk synchronously per command. Mutators
-(`SET`/`INCR`/`HSET`/`LPUSH`/…) mark the entry into a per-backend **dirty-set**
-and queue tombstones for `DEL` / TTL eviction in a per-backend
-`pending_deletes` list. At `XACT_EVENT_PRE_COMMIT` of the user's transaction,
-the dirty-set drains in a **single SPI session** via six cached
-`SPI_keepplan` plans, all parameterized with `unnest()` array inputs so an
-entire batch — store rows, hash fields, list items — flushes in at most six
-`SPI_execute_plan` calls. Repeated mutations of the same key inside one
-transaction coalesce into a single durable write (see
-[src/persistence.c](src/persistence.c) `run_flush`).
+Оскільки все виконується всередині бекенда, тривалі записи використовують
+**транзакцію, що викликає команду**:
 
-### Transaction integration
+- `SET k v` → оновлює in-memory запис, потім робить upsert у `pgredis.store`
+  через SPI в тій самій `XID`. `ROLLBACK` видалить рядок.
+- `XactCallback` (`pg_redis_xact_cb_persistence`) слухає `XACT_EVENT_ABORT` і
+  встановлює per-backend прапор «потрібне перезавантаження». **Наступний** доступ
+  ліниво перезавантажує трвалий вигляд; до того часу in-memory копія ще показує
+  відкотне значення — виконайте один GET після rollback для ресинхронізації.
+- Ліниве завантаження запускається також при першій команді у свіжому бекенді:
+  сканується `pgredis.store WHERE expire_at IS NULL OR expire_at > now()` і
+  заповнюється in-memory HTAB.
 
-Because everything runs inside the calling backend, durable writes use the
-**calling transaction**:
+### Фоновий воркер
 
-- `SET k v` → updates the in-memory entry, then upserts `pgredis.store` via
-  SPI under the same `XID`. A `ROLLBACK` removes the row.
-- An `XactCallback` (`pg_redis_xact_cb_persistence`) listens for
-  `XACT_EVENT_ABORT` and flips a per-backend "needs reload" flag. The **next**
-  access lazy-reloads the durable view; until then the in-memory copy still
-  shows the aborted value — read once after rollback to re-sync.
-- Lazy load (`pg_redis_persistence_load_if_needed`) also runs on the first
-  command in a fresh backend: it scans `pgredis.store WHERE expire_at IS NULL
-  OR expire_at > now()` and repopulates the in-memory HTAB so backend B sees
-  what backend A committed.
+Реєструється лише при `shared_preload_libraries = 'pg_redis'` **та**
+`pg_redis.enable_background_worker = on` (див. [src/bgworker.c](src/bgworker.c)).
+Цикл:
 
-### Background worker
-
-Registered only when `shared_preload_libraries = 'pg_redis'` **and**
-`pg_redis.enable_background_worker = on` — see [src/bgworker.c](src/bgworker.c). Lifecycle:
-
-1. On postmaster start, `_PG_init` calls `pg_redis_bgworker_register()` to
-   request a `BackgroundWorker` slot.
-2. The worker connects to the `postgres` database and enters a loop:
-   wait on its latch for `pg_redis.flush_interval` seconds, then call
+1. При старті постмайстра `_PG_init` викликає `pg_redis_bgworker_register()`.
+2. Воркер підключається до бази `postgres` і входить у цикл: чекає на своєму
+   latch протягом `pg_redis.flush_interval` секунд, потім викликає
    `pg_redis_jobs_tick()`.
-3. `_tick` opens a transaction, scans `pgredis.jobs WHERE enabled AND
-   next_run <= now()`, dispatches each `job_type` to its handler
-   (`ttl_cleanup`, `snapshot_save`, `flush_dirty_keys`), updates `last_run`
-   / `next_run` / `last_error`, and bumps `pgredis.job_stats`.
-4. `SIGTERM` → clean shutdown. `SIGHUP` → reread GUCs.
+3. `_tick` відкриває транзакцію, сканує `pgredis.jobs WHERE enabled AND
+   next_run <= now()`, обробляє кожен `job_type` (`ttl_cleanup`,
+   `snapshot_save`, `flush_dirty_keys`), оновлює `last_run` / `next_run` /
+   `last_error` і лічильники в `pgredis.job_stats`.
+4. `SIGTERM` → чисте завершення. `SIGHUP` → перечитування GUC.
 
-Because the worker is its own backend, its in-memory keyspace is empty —
-`flush_dirty_keys` is a no-op in v0.1 (it logs `DEBUG1`). The sweep that
-matters today is `ttl_cleanup`, which runs `DELETE FROM pgredis.store WHERE
-expire_at <= now()` and so cleans up durable rows across the whole cluster.
-`snapshot_save` calls `pg_redis_persistence_save_snapshot()` to insert a fresh
-row into `pgredis.snapshots`.
+### Приклад: `SET` від початку до кінця (режим sync_table)
 
-`RUN_JOB(<id>)` runs the same handler **inline** in a regular backend — useful
-for tests and for one-off triggers without enabling the worker.
+1. `pgredis."SET"(k, v)` входить у `pg_redis_set` в [src/pg_redis.c](src/pg_redis.c).
+2. Перевіряються аргументи (`pg_redis_check_key_len`, `pg_redis_check_value_len`).
+3. `pg_redis_persistence_load_if_needed()` — перший виклик у цьому бекенді
+   читає `pgredis.store` + `pgredis.hash_fields` + `pgredis.list_items`.
+4. `pg_redis_store_upsert(k)` — знаходить або створює запис у HTAB.
+5. Старе in-memory значення звільняється; нове palloc'ується в
+   `PgRedisMemoryContext`; `version++`.
+6. `pg_redis_mark_dirty(e)` — ідемпотентне додавання в dirty-set. SPI поки немає.
+7. Функція повертає `true` у SQL. При `XACT_EVENT_PRE_COMMIT` dirty-set
+   спустошується; тривалі рядки потрапляють у **поточну** транзакцію. `ROLLBACK`
+   пропускає скидання і відкидає dirty-set.
 
-### Lifecycle of one `SET` (sync_table mode, default)
+## Збірка
 
-1. `pgredis."SET"(k, v)` enters `pg_redis_set` in
-   [src/pg_redis.c](src/pg_redis.c).
-2. Args are validated (`pg_redis_check_key_len`, `pg_redis_check_value_len`).
-   The key is materialized into a 256-byte stack buffer when short enough to
-   skip per-call `palloc`/`pfree` on the hot path.
-3. `pg_redis_persistence_load_if_needed()` — first call in this backend reads
-   `pgredis.store` + `pgredis.hash_fields` + `pgredis.list_items` and
-   populates the HTAB.
-4. `pg_redis_store_upsert(k)` — find or create the entry in the HTAB.
-5. The old in-memory value (if any) is released; the new payload is
-   palloc'd into `PgRedisMemoryContext` and attached to the entry; `version++`.
-6. `pg_redis_mark_dirty(e)` — idempotent push into the per-backend dirty-set.
-   No SPI yet.
-7. The function returns `true` to SQL immediately. At
-   `XACT_EVENT_PRE_COMMIT` the dirty-set drains via cached `SPI_keepplan`
-   array-form plans; the durable row(s) land in the **calling** transaction.
-   A `ROLLBACK` skips the flush and discards the dirty-set, and the
-   `XactCallback` marks the backend's lazy-load flag dirty for re-sync on
-   next access.
-
-## Build
-
-Requirements: **PostgreSQL 18+ (hard requirement)**, a C toolchain, `pg_config`
-on your `PATH`, and the PostgreSQL server development headers (e.g.
-`postgresql-server-dev-18` on Debian/Ubuntu, `postgresql@18` on Homebrew). The
-build will refuse to compile against any earlier server version — pg_redis
-uses PG18-only features (`uuidv7()`, virtual generated columns) in its SQL.
+Вимоги: **PostgreSQL 18+ (жорстка вимога)**, C-тулчейн, `pg_config` у `PATH`
+та заголовки сервера PostgreSQL (наприклад, `postgresql-server-dev-18` на
+Debian/Ubuntu, `postgresql@18` у Homebrew). Збірка відмовиться компілюватися
+проти більш ранніх версій — pg_redis використовує функції тільки PG18
+(`uuidv7()`, virtual generated columns) у своєму SQL.
 
 ```bash
 make
 sudo make install
 ```
 
-On macOS with Homebrew:
+На macOS з Homebrew:
 
 ```bash
 PATH="/opt/homebrew/opt/postgresql@18/bin:$PATH" make
 sudo PATH="/opt/homebrew/opt/postgresql@18/bin:$PATH" make install
 ```
 
-### PostgreSQL 18 features in use
+### Функції PostgreSQL 18, що використовуються
 
-- **`uuidv7()`** for `pgredis.snapshots.snapshot_id` — time-ordered identifiers
-  without a sequence and without round-trip latency.
-- **Virtual generated columns** — `pgredis.store.key_bytes` is computed at
-  read time as `octet_length(key)`; it occupies no storage and never goes
-  stale.
-- **Compile-time gate** — `src/pg_redis.c` raises `#error` against any PG
-  prior to 18.
+- **`uuidv7()`** для `pgredis.snapshots.snapshot_id` — часовпорядковані
+  ідентифікатори без sequence і без затримки round-trip.
+- **Virtual generated columns** — `pgredis.store.key_bytes` обчислюється при
+  читанні як `octet_length(key)`; не займає місця на диску і ніколи не застаріває.
+- **Compile-time gate** — `src/pg_redis.c` генерує `#error` при компіляції
+  проти PG молодшого за 18.
 
 ## Docker
 
-A multi-stage `Dockerfile` is provided that builds the extension against
-`postgres:<PG_VERSION>-bookworm`, runs `make installcheck` inside the image,
-and produces a runtime image with the extension installed.
+Надається багатоетапний `Dockerfile`, що збирає розширення проти
+`postgres:<PG_VERSION>-bookworm`, запускає `make installcheck` всередині образу
+та створює runtime-образ із встановленим розширенням.
 
 ```bash
-# Build the runtime image (postgres + pg_redis preinstalled)
-make docker-build                # default PG_VERSION=18
-PG_VERSION=18 make docker-build  # explicit (PG18+ only)
+# Зібрати runtime-образ (postgres + pg_redis передвстановлено)
+make docker-build                # PG_VERSION=18 за замовчуванням
+PG_VERSION=18 make docker-build  # явно
 
-# Run the regression suite inside Docker (builds the `test` stage)
+# Запустити регресійні тести всередині Docker
 make docker-test
 
-# Spin up postgres with the extension preloaded
+# Запустити postgres із попередньо завантаженим розширенням
 make docker-up
 psql "postgres://postgres:postgres@localhost:5432/postgres" -c \
     "CREATE EXTENSION pg_redis; SELECT pgredis.\"INFO\"();"
 make docker-down
 ```
 
-`make docker-test` succeeds only if every regression file in `test/sql/`
-diffs cleanly against `test/expected/`. Failures dump
-`test/regression.diffs` and the postgres log to the build output.
+`make docker-test` успішний лише якщо кожен регресійний файл у `test/sql/`
+збігається з `test/expected/`. У разі відмови виводяться `test/regression.diffs`
+та лог postgres.
 
-The suite covers the full SQL surface:
+Тести охоплюють всю SQL-поверхню:
 
-| File | Covers |
+| Файл | Покриває |
 | --- | --- |
-| `basic.sql` | SET/GET/DEL/EXISTS, INCR/DECR (incl. non-numeric error), MEMORY_USAGE, FLUSHALL, KEYS |
-| `ttl.sql` | EXPIRE/TTL semantics (`-1`/`-2`), lazy expiry, `EXPIRE 0` / negative as delete |
-| `hashes.sql` | HSET/HGET/HDEL/HEXISTS + WRONGTYPE both directions |
-| `lists.sql` | LPUSH/RPUSH/LPOP/RPOP/LLEN, empty-pop NULL, LIFO order, WRONGTYPE |
-| `persistence.sql` | sync_table write-through, SAVE + snapshots, ROLLBACK semantics |
-| `admin.sql` | STATS, INFO, BGSAVE, BGREWRITEAOF, PG18 virtual column on `pgredis.store`, UUIDv7 snapshot ids |
-| `jobs.sql` | ADD_TTL_CLEANUP_POLICY / ADD_FLUSH_POLICY / ADD_SNAPSHOT_POLICY, JOBS, RUN_JOB (incl. missing), JOB_STATS, DELETE_JOB |
+| `basic.sql` | SET/GET/DEL/EXISTS, INCR/DECR (включаючи помилку для нечислових), MEMORY_USAGE, FLUSHALL, KEYS |
+| `ttl.sql` | Семантика EXPIRE/TTL (`-1`/`-2`), ліниве закінчення, `EXPIRE 0` / від'ємні як delete |
+| `hashes.sql` | HSET/HGET/HDEL/HEXISTS + WRONGTYPE в обидва боки |
+| `lists.sql` | LPUSH/RPUSH/LPOP/RPOP/LLEN, NULL при пустому pop, порядок LIFO, WRONGTYPE |
+| `persistence.sql` | Наскрізний запис sync_table, SAVE + знімки, семантика ROLLBACK |
+| `admin.sql` | STATS, INFO, BGSAVE, BGREWRITEAOF, virtual column PG18 на `pgredis.store`, UUIDv7 snapshot ids |
+| `jobs.sql` | ADD_TTL_CLEANUP_POLICY / ADD_FLUSH_POLICY / ADD_SNAPSHOT_POLICY, JOBS, RUN_JOB, JOB_STATS, DELETE_JOB |
 
-When you add or edit a test, regenerate the committed expected output with:
+Для регенерації очікуваного виводу:
 
 ```bash
 make docker-regen
 ```
 
-This runs `installcheck` inside the builder image with `test/expected/`
-bind-mounted, and copies the fresh `test/results/*.out` over the host's
-expected files. Review the diff in `git status` before committing.
+## Бенчмарк vs Redis
 
-## Benchmark vs real Redis
-
-A Python harness in `bench/` runs identical workloads against real Redis and
-pg_redis, then prints a side-by-side report to stdout. Workload covers
-strings (`SET`/`GET`/`EXISTS`/`DEL`), counters (`INCR`/`DECR`), hashes
-(`HSET`/`HGET`/`HDEL`), and lists (`LPUSH`/`RPUSH`/`LPOP`/`RPOP`/`LLEN`).
+Python-харнес у `bench/` виконує однакові навантаження проти реального Redis і
+pg_redis, потім виводить порівняльний звіт. Навантаження охоплює рядки
+(`SET`/`GET`/`EXISTS`/`DEL`), лічильники (`INCR`/`DECR`), хеші
+(`HSET`/`HGET`/`HDEL`) і списки (`LPUSH`/`RPUSH`/`LPOP`/`RPOP`/`LLEN`).
 
 ```bash
-# Default: 1000 iterations per op
+# За замовчуванням: 1000 ітерацій на операцію
 make docker-bench
 
-# Larger sample (slower)
+# Більша вибірка (повільніше)
 BENCH_N=5000 make docker-bench
 ```
 
-The target spins up `redis:7-alpine`, the `pg_redis:18` runtime image, and a
-Python container with `redis-py` + `psycopg`. After the run it tears
-everything down. Sample output (single-client, single-connection, BENCH_N=500
-on Docker Desktop / Apple Silicon):
+Приклад виводу (один клієнт, одне з'єднання, BENCH_N=500 на Docker Desktop /
+Apple Silicon):
 
 ```text
 Op       System        ops/sec        p50        p95        p99       winner
@@ -346,215 +300,189 @@ GET      redis         18.1k/s     52.2us     69.9us     89.2us       2.1x pg
 Aggregate throughput: redis = 18.7k/s, pg_redis = 4.3k/s  (redis 4.3x faster overall)
 ```
 
-Reading the numbers: pg_redis loses on writes (each SET goes through the SQL
-parser, planner, and a write-through INSERT into `pgredis.store`) but wins
-on pure-read ops because the hashmap lookup is in-process while redis-py
-has to round-trip TCP. Useful as a sanity check, not as a marketing claim.
+pg_redis програє на записах (кожен SET проходить через SQL-парсер, планувальник
+і INSERT у `pgredis.store`), але виграє на чистих читаннях, бо пошук у хешмапі
+відбувається внутрішньопроцесно, тоді як redis-py потребує round-trip по TCP.
 
-## Install in a database
+## Встановлення в базу даних
 
 ```sql
 CREATE EXTENSION pg_redis;
 ```
 
-The extension provisions schema `pgredis` plus eight internal tables
-(`store`, `hash_fields`, `list_items`, `meta`, `jobs`, `job_stats`,
-`snapshots`, `aof`). All tables are marked as extension config tables, so
-`pg_dump` includes your user data.
+Розширення створює схему `pgredis` та вісім внутрішніх таблиць (`store`,
+`hash_fields`, `list_items`, `meta`, `jobs`, `job_stats`, `snapshots`, `aof`).
+Усі таблиці зареєстровані як extension config tables, тому `pg_dump` включає
+дані користувача.
 
-To remove:
+Для видалення:
 
 ```sql
 DROP EXTENSION pg_redis CASCADE;
 ```
 
-### Migration v0.1 → v0.2 (pg_redis 1.0 → 1.1) — BREAKING
+### Міграція v0.1 → v0.2 (pg_redis 1.0 → 1.1) — НЕСУМІСНА ЗМІНА
 
-v1.1 changes the on-disk format:
+v1.1 змінює формат на диску:
 
-- `pgredis.store.value` is now `bytea` (was `jsonb`), carrying a binary TLV
-  `[u8 tag][u32 length_le][payload]` for string/int payloads only.
-- Hash payloads live in `pgredis.hash_fields(key, field, value bytea)`.
-- List payloads live in `pgredis.list_items(key, ord bigint, value bytea)`.
+- `pgredis.store.value` тепер `bytea` (раніше `jsonb`), з бінарним TLV
+  `[u8 tag][u32 length_le][payload]` для рядків/цілих.
+- Поля хешів — у `pgredis.hash_fields(key, field, value bytea)`.
+- Елементи списків — у `pgredis.list_items(key, ord bigint, value bytea)`.
 
-There is no in-place data migration: the v1.0 `jsonb` rows cannot be
-translated to the new TLV format without C-level encoding context. The
-upgrade script refuses to run against a populated keyspace.
+Автоматичної міграції немає: рядки v1.0 у форматі `jsonb` неможливо перевести
+у TLV без C-контексту кодування. Скрипт оновлення відмовляється запускатися
+при непорожньому просторі ключів.
 
-**Required pre-upgrade workflow:**
+**Необхідний workflow перед оновленням:**
 
 ```sql
--- Option A: disposable data
+-- Варіант A: дані можна викинути
 SELECT pgredis."FLUSHALL"();
 
--- Option B: snapshot first, then flush (snapshots survive the upgrade)
+-- Варіант B: зробити знімок, потім очистити
 SELECT pgredis."SAVE"();
 SELECT pgredis."FLUSHALL"();
 
 ALTER EXTENSION pg_redis UPDATE TO '1.1';
 ```
 
-If the keyspace is non-empty, the upgrade `RAISE`s with instructions to run
-`FLUSHALL` first.
+Якщо простір ключів непорожній, оновлення видасть `RAISE` з інструкцією
+виконати `FLUSHALL` спершу.
 
-**Rollback:** downgrade requires
+**Відкат:** потребує
 `DROP EXTENSION pg_redis; CREATE EXTENSION pg_redis VERSION '1.0';`.
-Data does not round-trip back to the v1.0 `jsonb` schema.
+Дані не повертаються у формат `jsonb` схеми v1.0.
 
-### Resolved design questions (from the v1.0 → v1.1 change proposal)
+## Чому всі функції в лапках ПРОПИСНИМИ?
 
-- **Naming (OQ2)**: `pg_redis_persistence_save_entry` and
-  `pg_redis_persistence_delete_key` are preserved as thin wrappers around
-  `pg_redis_mark_dirty` / `pg_redis_mark_deleted`. Internal callers in
-  `src/pg_redis.c` use the new names directly; the old symbols stay as a
-  compatibility shim for any out-of-tree consumer.
-- **List ordinals (OQ4)**: `min_ord` / `max_ord` are recomputed per list on
-  load (`min(ord)`, `max(ord)` over `pgredis.list_items`) — no separate
-  metadata row, no schema bloat.
-- **Batch sizing (OQ3)**: the pre-commit flush always issues at most one
-  `SPI_execute_plan` per category. `pg_redis.flush_batch_size` continues to
-  govern only the bgworker dirty-keys job.
-
-## Why all the quoted UPPERCASE?
-
-PostgreSQL folds unquoted identifiers to lower case. Redis commands are
-canonically UPPERCASE, so to make `pgredis."SET"` and `pgredis."GET"` map
-1-to-1 with the documentation you'd expect, the extension declares them as
-**quoted** identifiers. That means you must quote them at the call site too:
+PostgreSQL приводить ненаведені в лапках ідентифікатори до нижнього регістру.
+Команди Redis канонічно ПРОПИСНІ, тому, щоб `pgredis."SET"` і `pgredis."GET"`
+відповідали документації один до одного, розширення оголошує їх як **наведені в
+лапках** ідентифікатори. Це означає, що ви теж маєте брати їх у лапки при
+виклику:
 
 ```sql
--- Works
+-- Працює
 SELECT pgredis."SET"('user:1:name', 'Alice');
 
--- Fails with: function pgredis.set(unknown, unknown) does not exist
+-- Помилка: function pgredis.set(unknown, unknown) does not exist
 SELECT pgredis.set('user:1:name', 'Alice');
 ```
 
-There is no `pgredis.set(text, text)` function; only `pgredis."SET"(text, text)`.
+Функції `pgredis.set(text, text)` не існує; тільки `pgredis."SET"(text, text)`.
 
-## SQL examples
+## Приклади SQL
 
 ```sql
 CREATE EXTENSION pg_redis;
 
--- Strings
+-- Рядки
 SELECT pgredis."SET"('user:1:name', 'Alice');
 SELECT pgredis."GET"('user:1:name');
 SELECT pgredis."DEL"('user:1:name');
 
--- Counters
+-- Лічильники
 SELECT pgredis."INCR"('hits');
 SELECT pgredis."INCR"('hits');
 SELECT pgredis."GET"('hits');                 -- '2'
 
--- TTL (-2 = no key, -1 = no TTL, else seconds)
+-- TTL (-2 = ключ відсутній, -1 = без TTL, інакше — секунди)
 SELECT pgredis."SET"('session:abc', 'token');
 SELECT pgredis."EXPIRE"('session:abc', 60);
 SELECT pgredis."TTL"('session:abc');          -- 59..60
 
--- Hashes
+-- Хеші
 SELECT pgredis."HSET"('user:1', 'name', 'Alice');
 SELECT pgredis."HSET"('user:1', 'age', '30');
 SELECT pgredis."HGET"('user:1', 'name');
 SELECT pgredis."HEXISTS"('user:1', 'age');
 
--- Lists (LPUSH at head, RPUSH at tail)
+-- Списки (LPUSH на початок, RPUSH на кінець)
 SELECT pgredis."RPUSH"('queue', 'job1');
 SELECT pgredis."RPUSH"('queue', 'job2');
 SELECT pgredis."LPOP"('queue');               -- 'job1'
 
--- Admin
+-- Адміністрування
 SELECT * FROM pgredis."KEYS"();
 SELECT pgredis."MEMORY_USAGE"();
 SELECT pgredis."INFO"();
 SELECT * FROM pgredis."STATS"();
 
--- Snapshot to the snapshots table
+-- Знімок у таблицю snapshots
 SELECT pgredis."SAVE"();
 
--- Background-job scheduling
+-- Планування фонових завдань
 SELECT pgredis."ADD_TTL_CLEANUP_POLICY"('30 seconds');
 SELECT pgredis."ADD_SNAPSHOT_POLICY"('1 hour');
 SELECT * FROM pgredis."JOBS"();
-SELECT pgredis."RUN_JOB"(1);                  -- runs the job inline
+SELECT pgredis."RUN_JOB"(1);                  -- виконати задачу inline
 SELECT * FROM pgredis."JOB_STATS"();
 ```
 
-## Configuration (GUCs)
+## Конфігурація (GUC)
 
-| GUC | Type | Default | Effect |
+| GUC | Тип | За замовчуванням | Ефект |
 | --- | --- | --- | --- |
-| `pg_redis.persistence_mode` | string | `sync_table` | `none`, `sync_table`, `async_table`, `snapshot`, or `aof`. `aof` falls back to `sync_table`. `async_table` is functional when paired with `storage_mode=shared`; otherwise it downgrades to `sync_table` with a `WARNING`. |
-| `pg_redis.storage_mode` | string | `session` | `session` (per-backend HTAB) or `shared` (cluster-wide HTAB visible to every backend). `shared` requires `shared_preload_libraries='pg_redis'`. |
-| `pg_redis.flush_interval` | int seconds | `5` | Background worker tick interval. In `async_table` mode, also the upper bound on the durability window for acknowledged writes. |
-| `pg_redis.flush_batch_size` | int | `1000` | Max dirty entries flushed per tick (reserved). |
-| `pg_redis.ttl_cleanup_interval` | int seconds | `30` | Default TTL sweep cadence for the `ttl_cleanup` job. |
-| `pg_redis.max_key_size` | int bytes | `1024` | Reject keys longer than this. |
-| `pg_redis.max_value_size` | int bytes | `1048576` | Reject values longer than this. Under `storage_mode=shared`, hash-field values have a tighter hard cap of `65535` bytes (bucket width) — oversize HSET fails with `ERRCODE_PROGRAM_LIMIT_EXCEEDED`. |
-| `pg_redis.enable_background_worker` | bool | `off` | Enable the worker (requires `shared_preload_libraries`). |
-| `pg_redis.shared_max_memory` | int MB | `256` | Cap on the DSA segment backing variable-size payloads in `storage_mode=shared`. Postmaster-only. |
-| `pg_redis.dirty_ring_size` | int slots | `65536` | Slots in the shared dirty-ring used by `async_table`. Postmaster-only. |
-| `pg_redis.lock_partitions` | int | `16` | Number of partitioned LWLocks guarding the shared HTAB. Postmaster-only. |
-| `pg_redis.async_full_action` | enum | `block` | What a producer does when the dirty-ring is full: `block` (spin briefly then `ERROR`) or `sync_flush` (drain inline in the producer's xact then retry). |
+| `pg_redis.persistence_mode` | string | `sync_table` | `none`, `sync_table`, `async_table`, `snapshot` або `aof`. `aof` відкочується до `sync_table`. `async_table` функціонує зі `storage_mode=shared`; інакше понижується до `sync_table` з `WARNING`. |
+| `pg_redis.storage_mode` | string | `session` | `session` (per-backend HTAB) або `shared` (кластерний HTAB, видимий кожному бекенду). `shared` потребує `shared_preload_libraries='pg_redis'`. |
+| `pg_redis.flush_interval` | int, секунди | `5` | Інтервал тіку фонового воркера. В режимі `async_table` — верхня межа вікна довговічності. |
+| `pg_redis.flush_batch_size` | int | `1000` | Макс. dirty-записів за тік (зарезервовано). |
+| `pg_redis.ttl_cleanup_interval` | int, секунди | `30` | Стандартний інтервал TTL-зачистки. |
+| `pg_redis.max_key_size` | int, байти | `1024` | Відхиляє ключі довші за це значення. |
+| `pg_redis.max_value_size` | int, байти | `1048576` | Відхиляє значення довші за це значення. |
+| `pg_redis.enable_background_worker` | bool | `off` | Вмикає воркер (потребує `shared_preload_libraries`). |
+| `pg_redis.shared_max_memory` | int, МБ | `256` | Обмеження DSA-сегменту для змінно-розмірних навантажень у `storage_mode=shared`. Тільки для постмайстра. |
+| `pg_redis.dirty_ring_size` | int, слоти | `65536` | Слоти в спільному dirty-ring для `async_table`. Тільки для постмайстра. |
+| `pg_redis.lock_partitions` | int | `16` | Кількість секційних LWLock для спільного HTAB. Тільки для постмайстра. |
+| `pg_redis.async_full_action` | enum | `block` | Що робить продюсер при повному dirty-ring: `block` або `sync_flush`. |
+| `pg_redis.bgworker_database` | string | `postgres` | База даних, до якої під'єднується фоновий воркер (для SPI). Якщо вона не існує, воркер записує один `FATAL` і **не перезапускається** (`BGW_NEVER_RESTART`) замість циклічного рестарту. Тільки для постмайстра, `SUPERUSER_ONLY`. |
+| `pg_redis.ring_reclaim_tick_interval` | int, тіки | `1024` | Кожні N тіків дренажу воркер виконує прохід відновлення слотів dirty-ring, що «застрягли» у стані `WRITING` (продюсер обірвався між резервуванням і публікацією). |
+| `pg_redis.ring_slot_stuck_timeout` | int, мс | `5000` | Скільки слот може лишатися у стані `WRITING`, перш ніж прохід відновлення поверне його в `EMPTY`. |
 
-Invalid persistence/storage values are rejected at `SET` time via a GUC
-`check_hook`.
+## Режими зберігання
 
-## Storage modes
+### `session` (за замовчуванням)
 
-### `session` (default)
-
-Each backend has its own `MemoryContext` and `dynahash` HTAB. Writes go to
-your in-memory copy and — in `sync_table` mode — to `pgredis.store` in the
-calling transaction. Other backends see your writes by reading the durable
-row on their next lazy-load.
+Кожен бекенд має власний `MemoryContext` і `dynahash` HTAB. Записи йдуть у
+in-memory копію і — в режимі `sync_table` — у `pgredis.store` в поточній
+транзакції. Інші бекенди бачать ваші записи, читаючи трвалий рядок при
+наступному ліниному завантаженні.
 
 ### `shared`
 
-The keyspace lives in PostgreSQL shared memory (`ShmemInitHash` with
-`HASH_PARTITION`) and is visible to every backend. Variable-size payloads
-(strings, hash field maps, list element chains) live in a single DSA segment
-sized by `pg_redis.shared_max_memory`. Access is serialized by
-`pg_redis.lock_partitions` partitioned `LWLock`s (reads take `LW_SHARED`,
-writes take `LW_EXCLUSIVE`).
+Простір ключів живе в спільній пам'яті PostgreSQL (`ShmemInitHash`,
+`HASH_STRINGS`) і видимий кожному бекенду. Змінно-розмірні навантаження
+(рядки, карти полів хешів, ланцюги елементів списків) живуть у єдиному
+DSA-сегменті розміром `pg_redis.shared_max_memory`. Доступ серіалізується
+**виключно** `pg_redis.lock_partitions` зовнішніми секційними `LWLock`
+(у v1.2 прибрано `HASH_PARTITION`: його внутрішня функція секціонування
+`string_hash` не збігалася із зовнішньою `hash_bytes`, що пошкоджувало HTAB
+під конкуренцією). HTAB наперед розрахований на `max_entries`, тож після старту
+не змінює розмір.
 
-Requires `shared_preload_libraries='pg_redis'` so the postmaster can reserve
-shared memory at startup. The keyspace is loaded once per postmaster lifetime
-from `pgredis.store` / `pgredis.hash_fields` / `pgredis.list_items` by the
-first backend to touch it (gated by an atomic loaded flag in the shared
-header).
+Потребує `shared_preload_libraries='pg_redis'`.
 
-Cross-backend visibility: after backend A's `SET k v` returns, backend B's
-next `GET k` returns `v` directly from shared memory — no detour through the
-durable table.
+> **Апгрейд до 1.2 (НЕСУМІСНА ЗМІНА розкладки спільної пам'яті).** Прибирання
+> `HASH_PARTITION` змінює in-shmem розкладку HTAB. Спільна пам'ять
+> відбудовується з трвалих таблиць при старті постмайстра, тож після
+> встановлення бінарника 1.2 потрібен **чистий перезапуск кластера** (або
+> `DROP EXTENSION pg_redis; CREATE EXTENSION pg_redis;`). Трвалі таблиці та
+> бінарний TLV-формат **не змінюються** — міграція даних не потрібна.
 
-## Persistence modes
+## Режими зберігання (persistence)
 
-| Mode | What happens on write | Durable on crash? | Visible to other backends? |
+| Режим | Що відбувається при записі | Довговічний після краш? | Видимий іншим бекендам? |
 | --- | --- | --- | --- |
-| `none` | memory only; dirty-set tracking still runs but pre-commit flush is a no-op | no | no (session-local) |
-| `sync_table` (default) | memory + queued in per-backend dirty-set; flushed in one batched SPI session at `XACT_EVENT_PRE_COMMIT` | yes (rolls back with the user xact) | yes (after their first command lazy-loads) |
-| `async_table` | memory writeback to shared HTAB + `PgRedisDirtyEvent` published to the shared dirty-ring; command returns before durability. The BGW drains the ring into durable tables in its own transaction at most every `flush_interval`. Requires `storage_mode=shared`. | yes, with bounded crash window | yes, immediately (shared HTAB is authoritative) |
-| `snapshot` | use `SAVE`/`BGSAVE` to emit point-in-time rows in `pgredis.snapshots` | by snapshot | snapshots are global |
-| `aof` | scaffolded only; `BGREWRITEAOF` returns false | no | n/a |
+| `none` | лише пам'ять; скидання no-op | ні | ні |
+| `sync_table` (за замовч.) | пам'ять + dirty-set; скидання при `XACT_EVENT_PRE_COMMIT` | так (відкочується з транзакцією) | так (після першого ліниного завантаження) |
+| `async_table` | пам'ять + `PgRedisDirtyEvent` у dirty-ring; команда повертається до довговічності | так, з обмеженим вікном краш-втрат | так, одразу (спільний HTAB авторитетний) |
+| `snapshot` | `SAVE`/`BGSAVE` → рядки в `pgredis.snapshots` | за знімком | знімки глобальні |
+| `aof` | лише каркас; `BGREWRITEAOF` повертає false | ні | н/д |
 
-**Crash window in `async_table`:** mutating commands are acknowledged to the
-caller before the BGW drains. A postmaster crash or hardware fault before
-the next drain loses any event still in the ring. Worst-case loss is
-bounded by `pg_redis.flush_interval` seconds of acked writes. The user's
-transaction `ROLLBACK` does **not** undo an `async_table` mutation — the
-shared HTAB is authoritative and the durable row will land regardless. A
-`WARNING` is emitted on `XACT_EVENT_ABORT` listing the number of events
-already published.
+### Конфігурація для `async_table`
 
-**Misconfiguration**: setting `persistence_mode='async_table'` with
-`storage_mode='session'` is a configuration error. The runtime emits a
-`WARNING` at GUC assignment and silently downgrades to `sync_table`
-behavior until `storage_mode` is corrected.
-
-### Configuration for `async_table`
-
-Minimum viable `postgresql.conf` for the async path:
+Мінімальний `postgresql.conf` для асинхронного шляху:
 
 ```conf
 shared_preload_libraries = 'pg_redis'
@@ -568,170 +496,97 @@ pg_redis.async_full_action = 'block'
 pg_redis.flush_interval = 5
 ```
 
-Cache workload (loss-tolerant, latency-sensitive):
+Кеш-навантаження (допустимі втрати, низька затримка):
 
 ```conf
-pg_redis.flush_interval = 10        # larger crash window; less BGW work
+pg_redis.flush_interval = 10
 pg_redis.async_full_action = 'block'
 ```
 
-Session-store workload (loss-averse, throughput-sensitive):
+Сховище сесій (мінімальні втрати, висока пропускна здатність):
 
 ```conf
-pg_redis.flush_interval = 1         # tighter crash window
-pg_redis.async_full_action = 'sync_flush'   # never error a write
-synchronous_commit = on             # default
+pg_redis.flush_interval = 1
+pg_redis.async_full_action = 'sync_flush'
+synchronous_commit = on
 ```
 
-Pure-cache "fastest" workload:
+Найшвидший режим кешу:
 
 ```conf
-synchronous_commit = off            # drop WAL fsync from the BGW's drain
+synchronous_commit = off
 pg_redis.flush_interval = 30
 ```
 
-### Tuning
+## Фонові воркери
 
-**Sizing `dirty_ring_size`** — pick `peak_write_rate × flush_interval × 2`
-as a starting point. Example: 10k writes/sec sustained × 5s flush_interval
-× 2 (safety) → 100k slots. Default 65536 covers ~6.5k writes/sec sustained
-at the default 5s flush_interval, which matches the single-client throughput
-floor measured on the bench harness.
-
-**Picking `async_full_action`** —
-
-- `block` (default): a producer that hits a full ring spins 100×100µs (~10ms
-  total) and then raises `ERRCODE_INSUFFICIENT_RESOURCES`. The user's
-  transaction aborts. Use when you'd rather surface backpressure as visible
-  errors than silently slow things down.
-- `sync_flush`: a producer that hits a full ring drains a batch inline,
-  then retries the slot claim. Commands never fail from ring fullness;
-  instead the producer takes the latency hit of a synchronous SPI session
-  that batch. The inline drain runs inside an internal subtransaction of
-  the user's transaction (so a drain failure is scoped to itself and does
-  not abort the surrounding command); from contexts with no active
-  transaction it falls back to a top-level transaction. Use when uniform
-  tail latency matters less than zero spurious failures.
-
-**Sizing `lock_partitions`** — defaults to 16, matching common multi-socket
-machines. Bump up only if you see write contention metrics dominated by
-LWLock waits on partition locks; the lock array itself is cheap, but more
-partitions mean more cache traffic on cross-key workloads.
-
-**Sizing `shared_max_memory`** — bound by the working-set size of your
-keyspace, not the number of keys. The fixed-size `PgRedisSharedEntry` lives
-in the HTAB header (no DSA cost); only variable payloads (string values,
-hash field maps, list element chains) consume DSA. Default 256MB suits a
-working set of ~100k average-size entries.
-
-## Background workers
-
-When you set:
+При налаштуванні:
 
 ```conf
-# postgresql.conf
 shared_preload_libraries = 'pg_redis'
 pg_redis.enable_background_worker = on
 ```
 
-…and restart PostgreSQL, the extension registers a single background worker
-("pg_redis bgworker") that connects to the `postgres` database. Each tick
-does two things:
+…і рестарті PostgreSQL розширення реєструє один фоновий воркер («pg_redis
+bgworker»), що підключається до бази `postgres`. Кожен тік виконує:
 
-1. **Job scheduler**: runs any job in `pgredis.jobs` whose `enabled` is true
-   and `next_run <= now()`.
-2. **Dirty-ring drain** (only when `persistence_mode=async_table`): if
-   pending events ≥ `dirty_ring_size / 4` OR the time since the last drain
-   ≥ `flush_interval`, the worker opens a transaction, drains the ring into
-   the durable tables using the same batched-array SPI plans as
-   `sync_table`'s pre-commit flush, and commits.
+1. **Планувальник завдань**: запускає будь-яку задачу з `pgredis.jobs`, де
+   `enabled = true` і `next_run <= now()`.
+2. **Скидання dirty-ring** (лише при `persistence_mode=async_table`): якщо
+   кількість подій ≥ `dirty_ring_size / 4` АБО час від останнього скидання ≥
+   `flush_interval`, воркер відкриває транзакцію і скидає ring у таблиці.
 
-Producers wake the worker eagerly by `SetLatch`'ing its latch when the ring
-crosses the watermark or fills up. The worker handles `SIGTERM` (clean
-shutdown — performs one final drain if any events remain) and `SIGHUP`
-(config reload).
+Ви завжди можете запустити задачу inline:
+`SELECT pgredis."RUN_JOB"(<id>)`.
 
-You can always run jobs inline from a regular backend via
-`SELECT pgredis."RUN_JOB"(<id>)` — useful for testing without changing
-`shared_preload_libraries`.
+## Обмеження транзакцій
 
-## Transaction limitations
+- Трвалий рядок у `pgredis.store` бере участь у транзакції, що викликає.
+  `ROLLBACK` видаляє рядок.
+- In-memory копія **не** відкочується. При `XACT_EVENT_ABORT` розширення
+  позначає «потрібне перезавантаження», і наступний доступ ліниво завантажить
+  відкотений трвалий вигляд з таблиці.
+- **Наслідок**: між відкоченим `SET` і наступним `GET` у тому ж бекенді
+  in-memory значення залишається новим. Виконайте GET після rollback для
+  ресинхронізації.
 
-- The durable row in `pgredis.store` participates in the calling transaction.
-  Roll back, and the row goes with it.
-- The in-memory copy is **not** rolled back. When `XACT_EVENT_ABORT` fires, the
-  extension marks "needs reload" and the next access in that backend
-  lazy-loads the (rolled-back) durable view from the table.
-- Implication: between an aborted `SET` and the next `GET` in the same
-  backend, the in-memory value remains the new one. Read after rollback to
-  re-sync.
+## Модель паралелізму
 
-## Concurrency model
+PostgreSQL — один процес на з'єднання. v0.1 зберігає простір ключів у
+**приватній пам'яті бекенда**, тому він не є спільним. Коректність між сесіями
+забезпечується через `pgredis.store`:
 
-PostgreSQL is process-per-connection. v0.1 stores the keyspace in the
-**calling backend's private memory**, so it is not shared. Cross-session
-correctness goes through `pgredis.store`:
+1. Бекенд A робить `SET k v` → пам'ять + рядок таблиці в транзакції A.
+2. Бекенд B робить `GET k` → перший доступ у B ліниво завантажує з таблиці →
+   B отримує `v`.
 
-1. Backend A does `SET k v` → memory + table row written in A's transaction.
-2. Backend B does `GET k` → first access in B lazy-loads from the table → B
-   gets `v`.
+При `pg_redis.persistence_mode = 'none'` крок 2 поверне `NULL`.
 
-If you set `pg_redis.persistence_mode = 'none'`, step 2 will return `NULL` —
-because there is no durable row to lazy-load.
+## Дорожня карта
 
-`shared_preload_libraries = 'pg_redis'` is required for the background worker
-and (eventually) the shared keyspace. It is **not** required for the extension
-itself or for any of the SQL commands.
+- Відтворення append-only файлу (`BGREWRITEAOF`, AOF replay).
+- Транзакційно-усвідомлений in-memory rollback.
+- `SUBSCRIBE`/`PUBLISH`, відсортовані множини, потоки — довгострокові плани.
+- Розподіл за базою даних / простором імен.
 
-## Roadmap
+## Примітки до релізів
 
-- Append-only file replay (`BGREWRITEAOF`, AOF replay on first use).
-- Transaction-aware in-memory rollback (cooperative subtransaction tracking).
-- `SUBSCRIBE`/`PUBLISH`, sorted sets, streams — long term.
-- Per-database / per-namespace separation.
+### v1.2 — `async_table` + `storage_mode=shared` (без змін схеми на диску)
 
-## Release notes
-
-### v1.2 — `async_table` + `storage_mode=shared` (no on-disk change)
-
-- `pg_redis.storage_mode='shared'` is now functional. The keyspace lives in
-  shared memory (`ShmemInitHash` with `HASH_PARTITION`) backed by a DSA
-  segment for variable-size payloads. Cross-backend visibility is immediate
-  — no detour through the durable table.
-- `pg_redis.persistence_mode='async_table'` is now functional. Mutating
-  commands publish a `PgRedisDirtyEvent` into a multi-producer / single-
-  consumer shared dirty-ring; the BGW drains it into durable tables in its
-  own transaction at most every `flush_interval`. Single-client autocommit
-  SET expected to improve ~3× over `sync_table` once the path is benched.
-- Four new GUCs: `pg_redis.shared_max_memory`, `pg_redis.dirty_ring_size`,
+- `pg_redis.storage_mode='shared'` тепер функціональний. Простір ключів живе
+  в спільній пам'яті PostgreSQL, підтримуваній DSA-сегментом. Видимість між
+  бекендами — миттєва.
+- `pg_redis.persistence_mode='async_table'` тепер функціональний. Мутуючі
+  команди публікують `PgRedisDirtyEvent` у спільний dirty-ring; BGW скидає
+  його в трвалі таблиці.
+- Чотири нові GUC: `pg_redis.shared_max_memory`, `pg_redis.dirty_ring_size`,
   `pg_redis.lock_partitions`, `pg_redis.async_full_action`.
-- Misconfiguration (`async_table` + `session`) emits a `WARNING` at GUC
-  assignment and runtime falls back to `sync_table`.
-- `ROLLBACK` of a transaction containing `async_table` mutations emits a
-  `WARNING` listing the number of already-acked events that will NOT be
-  undone — `async_table` is durable independently of the user's xact.
-- No on-disk schema change; v1.1 schema is sufficient. Operators opt in
-  via GUCs plus `shared_preload_libraries='pg_redis'`.
+- Неправильна конфігурація (`async_table` + `session`) видає `WARNING` і
+  відкочується до поведінки `sync_table`.
+- `ROLLBACK` транзакції з `async_table`-мутаціями видає `WARNING` з кількістю
+  вже підтверджених подій, які NOT будуть скасовані.
+- Немає змін схеми на диску; схема v1.1 достатня.
 
-## Test layout
+## Ліцензія
 
-Regression tests live under `test/sql/` (input scripts) and `test/expected/`
-(expected output). The `Makefile` sets `REGRESS_OPTS = --inputdir=test
---outputdir=test`. Run them with:
-
-```bash
-make installcheck
-```
-
-Expected output is not committed in v0.1; regenerate with:
-
-```bash
-# After the first successful run, copy results/ to expected/:
-cp test/results/*.out test/expected/
-```
-
-…and re-run `make installcheck` to confirm a clean diff.
-
-## License
-
-See `LICENSE` (Apache-2.0 by default).
+Дивіться `LICENSE` (Apache-2.0).

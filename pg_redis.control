@@ -1,6 +1,6 @@
 # pg_redis extension (requires PostgreSQL 18+)
 comment = 'Redis-like in-memory key-value store embedded in PostgreSQL (requires PG18+)'
-default_version = '1.1'
+default_version = '1.2'
 module_pathname = '$libdir/pg_redis'
 relocatable = false
 schema = pgredis

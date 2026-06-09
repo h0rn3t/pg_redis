@@ -18,7 +18,8 @@ OBJS = \
 	src/shared_list.o \
 	src/shared_store.o
 
-DATA         = pg_redis--1.0.sql pg_redis--1.0--1.1.sql pg_redis--1.1.sql
+DATA         = pg_redis--1.0.sql pg_redis--1.0--1.1.sql pg_redis--1.1.sql \
+               pg_redis--1.1--1.2.sql pg_redis--1.2.sql
 REGRESS      = basic ttl hashes lists persistence flush admin jobs async_table
 REGRESS_OPTS = --inputdir=test --outputdir=test
 

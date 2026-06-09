@@ -206,6 +206,9 @@ extern int	pg_redis_shared_max_memory_mb;
 extern int	pg_redis_dirty_ring_size;
 extern int	pg_redis_lock_partitions;
 extern int	pg_redis_async_full_action;	/* parsed from enum GUC */
+extern int	pg_redis_ring_reclaim_tick_interval;	/* drain ticks between reclaim passes */
+extern int	pg_redis_ring_slot_stuck_timeout_ms;	/* grace before a stuck WRITING slot is reclaimed */
+extern char *pg_redis_bgworker_database;	/* DB the bgworker connects to */
 
 /* Persistence mode enumeration (parsed from GUC string). */
 typedef enum PgRedisPersistenceMode

@@ -4,6 +4,7 @@
 #include "storage/lwlock.h"
 #include "storage/shmem.h"
 #include "utils/elog.h"
+#include "utils/timestamp.h"
 
 #include <string.h>
 
@@ -89,31 +90,85 @@ pg_redis_dirty_ring_full(void)
 	return pg_redis_dirty_ring_pending() >= (uint64) ring_capacity;
 }
 
-/*
- * Producer path. Backpressure governed by pg_redis.async_full_action:
- *   - block: spin briefly (100 × 100µs = ~10ms), wake the BGW, then ERROR.
- *   - sync_flush: handled by the caller in [src/persistence.c] which drains
- *     locally before retrying — this function just signals "full" via ERROR
- *     so the caller can fall back. (Pure ring code stays mechanism-only.)
- *
- * Slot acquisition uses pg_atomic_fetch_add_u64 on write_head; the slot
- * index is the returned value modulo ring_capacity.
- */
-/* Forward decl — defined in src/persistence.c. Called by publish() when the
- * ring is full and async_full_action='sync_flush'. The producer drains
- * synchronously inside an internal subtransaction of the user's xact (or a
- * top-level transaction when no outer xact is active), so commits become
- * slower instead of failing. NULL-safe: returns 0 if persistence layer
- * can't drain. */
-extern int pg_redis_persistence_sync_drain(void);
-
 void
+pg_redis_dirty_ring_inspect(uint64 *out_write_head, uint64 *out_read_head,
+							uint64 *out_pending, int32 *out_stuck_writing)
+{
+	PgRedisSharedHeader *h = pg_redis_shmem_header();
+	uint64		w = 0,
+				r = 0,
+				pos;
+	int32		stuck = 0;
+
+	if (h != NULL && ring_slots != NULL && ring_capacity > 0)
+	{
+		r = pg_atomic_read_u64(&h->ring_read_head);
+		w = pg_atomic_read_u64(&h->ring_write_head);
+
+		/* Scan [read_head, write_head] inclusive — a stuck WRITING slot lives
+		 * at write_head under the advance-after-READY protocol. Best-effort,
+		 * no lock held. */
+		for (pos = r; pos <= w; pos++)
+		{
+			if (pg_atomic_read_u32(&ring_slots[pos % ring_capacity].state) == SLOT_WRITING)
+				stuck++;
+		}
+	}
+
+	if (out_write_head != NULL)
+		*out_write_head = w;
+	if (out_read_head != NULL)
+		*out_read_head = r;
+	if (out_pending != NULL)
+		*out_pending = (w > r) ? (w - r) : 0;
+	if (out_stuck_writing != NULL)
+		*out_stuck_writing = stuck;
+}
+
+/* Forward decl — defined in src/persistence.c. Called by publish_blocking()
+ * when the ring is full and async_full_action='sync_flush'. The producer
+ * drains synchronously inside an internal subtransaction of the user's xact
+ * (or a top-level transaction when no outer xact is active), so commits become
+ * slower instead of failing. */
+extern int	pg_redis_persistence_sync_drain(void);
+
+/* Free an event's DSA spill payload (if any). Used on publish failure paths
+ * where the event never made it into a slot, so the caller still owns the
+ * payload and must release it to avoid leaking shared memory. */
+static void
+free_event_spill(PgRedisDirtyEvent *ev)
+{
+	if (ev->dsa_overflow && ev->dsa_payload != InvalidDsaPointer)
+	{
+		pg_redis_shared_pfree(ev->dsa_payload);
+		ev->dsa_payload = InvalidDsaPointer;
+		ev->dsa_overflow = 0;
+	}
+}
+
+/*
+ * Producer reservation + publish — two-phase, mechanism only (Decision 4).
+ *
+ * Reserve: read write_head/read_head; if the ring is full, return
+ * PG_REDIS_RING_FULL without touching any shared state. Otherwise CAS
+ * slots[w % cap] EMPTY->WRITING. On CAS failure (a racing producer owns the
+ * slot, or it is mid-drain / awaiting reclaim) retry the reservation from the
+ * top — write_head cannot advance past w until slots[w]'s owner publishes it.
+ *
+ * Write: fill the slot payload.
+ *
+ * Publish: pg_write_barrier(), CAS state WRITING->READY, then CAS write_head
+ * w -> w+1. write_head advances ONLY past a slot already marked READY, so a
+ * producer that ereports between WRITING and READY leaves write_head unchanged
+ * and the slot in WRITING for the reclaim pass — it never punches a hole in
+ * [read_head, write_head) that would permanently stall the consumer (bug #4).
+ */
+PgRedisRingPublishResult
 pg_redis_dirty_ring_publish(const PgRedisDirtyEvent *ev)
 {
 	PgRedisSharedHeader *h = pg_redis_shmem_header();
-	uint64		my_slot;
-	int			spin;
 	PgRedisDirtyEvent *target;
+	uint64		w;
 	uint32		expected;
 
 	if (h == NULL || ring_slots == NULL || ring_capacity <= 0)
@@ -123,55 +178,28 @@ pg_redis_dirty_ring_publish(const PgRedisDirtyEvent *ev)
 				 errdetail("This indicates persistence_mode='async_table' without "
 						   "shared_preload_libraries='pg_redis'.")));
 
-	/* Spin-wait for room. The window we watch is
-	 *   write_head - read_head < ring_capacity. */
-	for (spin = 0;; spin++)
+	/* Phase 1: reserve a slot. */
+	for (;;)
 	{
-		uint64		w = pg_atomic_read_u64(&h->ring_write_head);
-		uint64		r = pg_atomic_read_u64(&h->ring_read_head);
+		uint64		r;
 
-		if (w - r < (uint64) ring_capacity)
-			break;
+		w = pg_atomic_read_u64(&h->ring_write_head);
+		r = pg_atomic_read_u64(&h->ring_read_head);
 
-		/* Full — kick the BGW and back off briefly. */
-		pg_redis_shmem_wake_bgw();
-		if (spin >= 100)
-		{
-			if (pg_redis_async_full_action == PG_REDIS_ASYNC_FULL_SYNC_FLUSH)
-			{
-				/* Drain inline in this backend. Then retry the slot
-				 * claim from the top. */
-				(void) pg_redis_persistence_sync_drain();
-				spin = 0;
-				continue;
-			}
-			ereport(ERROR,
-					(errcode(ERRCODE_INSUFFICIENT_RESOURCES),
-					 errmsg("pg_redis: async dirty-ring is full"),
-					 errhint("Raise pg_redis.dirty_ring_size, or set "
-							 "pg_redis.async_full_action='sync_flush' for inline drain.")));
-		}
-		pg_usleep(100);
-	}
+		if (w - r >= (uint64) ring_capacity)
+			return PG_REDIS_RING_FULL;
 
-	my_slot = pg_atomic_fetch_add_u64(&h->ring_write_head, 1);
-	target = &ring_slots[my_slot % ring_capacity];
-
-	/* Wait for the slot to be empty (consumer may not have finished
-	 * draining a prior wraparound). */
-	for (spin = 0;; spin++)
-	{
+		target = &ring_slots[w % ring_capacity];
 		expected = SLOT_EMPTY;
 		if (pg_atomic_compare_exchange_u32(&target->state, &expected, SLOT_WRITING))
-			break;
-		if (spin >= 1000)
-			ereport(ERROR,
-					(errcode(ERRCODE_INTERNAL_ERROR),
-					 errmsg("pg_redis: dirty-ring slot stuck — consumer lagging?")));
-		pg_usleep(10);
+			break;				/* reserved position w */
+
+		CHECK_FOR_INTERRUPTS();
 	}
 
-	/* Copy the event payload. */
+	/* Phase 2: write payload. state/write_started_at are managed here, NOT
+	 * copied from ev (ev's state field is meaningless on the local stack). */
+	target->write_started_at = GetCurrentTimestamp();
 	target->type = ev->type;
 	target->value_type = ev->value_type;
 	target->key_len = ev->key_len;
@@ -186,52 +214,233 @@ pg_redis_dirty_ring_publish(const PgRedisDirtyEvent *ev)
 	memcpy(target->inline_bytes, ev->inline_bytes,
 		   sizeof(target->inline_bytes));
 
+	/* Phase 3: publish. The write barrier ensures the payload is visible
+	 * before the consumer can observe SLOT_READY. */
 	pg_write_barrier();
-	pg_atomic_write_u32(&target->state, SLOT_READY);
+	expected = SLOT_WRITING;
+	if (!pg_atomic_compare_exchange_u32(&target->state, &expected, SLOT_READY))
+	{
+		/* Our slot was reclaimed out from under us (we exceeded
+		 * ring_slot_stuck_timeout between reserve and publish — pathological
+		 * for a live producer). The payload write is void; the slot now belongs
+		 * to whoever the reclaim handed it to. Tell the caller to retry, and
+		 * since the slot took our dsa_payload pointer by copy we must NOT free
+		 * it here (the reclaim left state EMPTY but never read the payload;
+		 * the pointer is still valid and still owned by the caller). */
+		return PG_REDIS_RING_FULL;
+	}
+
+	/* Advance write_head past the now-READY slot. We are the unique owner of
+	 * position w, and write_head only advances one position at a time by the
+	 * owner of that position, so write_head must still equal w here. */
+	{
+		uint64		ew = w;
+
+		(void) pg_atomic_compare_exchange_u64(&h->ring_write_head, &ew, w + 1);
+		Assert(ew == w);
+	}
+
+	return PG_REDIS_RING_OK;
 }
 
 /*
- * Consumer drain. Reads up to `max` ready slots starting at read_head,
- * copies them into out_buf, advances read_head and clears slot states.
+ * Producer-side blocking publish for callers holding NO pg_redis LWLock.
+ * Applies pg_redis.async_full_action on a full ring and loops until the event
+ * is published or it raises.
+ */
+void
+pg_redis_dirty_ring_publish_blocking(PgRedisDirtyEvent *ev)
+{
+	int			spin = 0;
+
+	for (;;)
+	{
+		if (pg_redis_dirty_ring_publish(ev) == PG_REDIS_RING_OK)
+			return;
+
+		/* Full ring. Wake the BGW and apply backpressure. No pg_redis LWLock
+		 * is held here, so draining synchronously is safe. */
+		pg_redis_shmem_wake_bgw();
+
+		if (pg_redis_async_full_action == PG_REDIS_ASYNC_FULL_SYNC_FLUSH)
+		{
+			(void) pg_redis_persistence_sync_drain();
+			spin = 0;
+			continue;
+		}
+
+		/* block mode: spin ~10ms then give up. */
+		if (++spin >= 100)
+		{
+			free_event_spill(ev);
+			ereport(ERROR,
+					(errcode(ERRCODE_INSUFFICIENT_RESOURCES),
+					 errmsg("pg_redis: async dirty-ring is full"),
+					 errhint("Raise pg_redis.dirty_ring_size, or set "
+							 "pg_redis.async_full_action='sync_flush' for inline drain.")));
+		}
+		pg_usleep(100);
+		CHECK_FOR_INTERRUPTS();
+	}
+}
+
+/*
+ * Consumer drain, phase 1 "collect" (Decision 11). Under ring_consumer_lock,
+ * copy up to `max` READY events starting at read_head into out_buf, CAS'ing
+ * each consumed slot READY->DRAINING. Does NOT advance read_head and does NOT
+ * free slots — that happens in release_batch() only after the durable write
+ * has been executed. Stops at the first non-READY slot (a WRITING producer or
+ * the empty tail). Records the consumed base (= read_head at entry) in
+ * *out_base and returns the count.
  */
 int
-pg_redis_dirty_ring_drain(PgRedisDirtyEvent *out_buf, int max)
+pg_redis_dirty_ring_collect(PgRedisDirtyEvent *out_buf, int max, uint64 *out_base)
 {
 	PgRedisSharedHeader *h = pg_redis_shmem_header();
 	uint64		w,
 				r;
-	int			drained = 0;
+	int			collected = 0;
+
+	if (out_base != NULL)
+		*out_base = 0;
+	if (h == NULL || ring_slots == NULL || ring_capacity <= 0)
+		return 0;
+
+	/* A sync_flush producer MUST have released its partition lock before
+	 * reaching here (Decision 10); the BGW holds nothing. */
+	pg_redis_assert_no_pg_redis_lwlock_held();
+
+	LWLockAcquire(h->ring_consumer_lock, LW_EXCLUSIVE);
+
+	r = pg_atomic_read_u64(&h->ring_read_head);
+	w = pg_atomic_read_u64(&h->ring_write_head);
+	if (out_base != NULL)
+		*out_base = r;
+
+	while (collected < max && r + (uint64) collected < w)
+	{
+		PgRedisDirtyEvent *slot = &ring_slots[(r + (uint64) collected) % ring_capacity];
+		uint32		expected = SLOT_READY;
+
+		if (!pg_atomic_compare_exchange_u32(&slot->state, &expected, SLOT_DRAINING))
+			break;				/* first non-READY slot: stop (preserves order) */
+
+		pg_read_barrier();
+		out_buf[collected] = *slot;		/* copy incl. dsa_payload pointer */
+		collected++;
+	}
+
+	LWLockRelease(h->ring_consumer_lock);
+	return collected;
+}
+
+/*
+ * Consumer drain, phase 3 "release" — success path. After the batch's durable
+ * write has been executed, advance read_head past it, flip the DRAINING slots
+ * to EMPTY, and free each event's DSA spill payload exactly once. Under
+ * ring_consumer_lock. `batch` is unused (the slots are authoritative) but kept
+ * for API symmetry.
+ */
+void
+pg_redis_dirty_ring_release_batch(const PgRedisDirtyEvent *batch, uint64 base, int n)
+{
+	PgRedisSharedHeader *h = pg_redis_shmem_header();
+	int			i;
+
+	if (h == NULL || ring_slots == NULL || ring_capacity <= 0 || n <= 0)
+		return;
+
+	LWLockAcquire(h->ring_consumer_lock, LW_EXCLUSIVE);
+
+	/* Only one drainer ever holds a given batch's DRAINING slots, and
+	 * read_head advances only under this lock, so read_head must still equal
+	 * base here. */
+	Assert(pg_atomic_read_u64(&h->ring_read_head) == base);
+
+	for (i = 0; i < n; i++)
+	{
+		PgRedisDirtyEvent *slot = &ring_slots[(base + (uint64) i) % ring_capacity];
+
+		if (slot->dsa_overflow && slot->dsa_payload != InvalidDsaPointer)
+		{
+			pg_redis_shared_pfree(slot->dsa_payload);
+			slot->dsa_payload = InvalidDsaPointer;
+			slot->dsa_overflow = 0;
+		}
+		pg_atomic_write_u32(&slot->state, SLOT_EMPTY);
+	}
+
+	pg_atomic_write_u64(&h->ring_read_head, base + (uint64) n);
+
+	LWLockRelease(h->ring_consumer_lock);
+}
+
+/*
+ * Consumer drain, phase 3 "abort" — failure path. The durable write raised
+ * before commit; reset the batch's DRAINING slots back to READY, leave
+ * read_head unchanged, and keep the DSA spill payloads (the slots still own
+ * them) so a subsequent drain re-collects and re-persists the events
+ * (at-least-once). Under ring_consumer_lock.
+ */
+void
+pg_redis_dirty_ring_abort_batch(const PgRedisDirtyEvent *batch, uint64 base, int n)
+{
+	PgRedisSharedHeader *h = pg_redis_shmem_header();
+	int			i;
+
+	if (h == NULL || ring_slots == NULL || ring_capacity <= 0 || n <= 0)
+		return;
+
+	LWLockAcquire(h->ring_consumer_lock, LW_EXCLUSIVE);
+	for (i = 0; i < n; i++)
+	{
+		PgRedisDirtyEvent *slot = &ring_slots[(base + (uint64) i) % ring_capacity];
+
+		pg_atomic_write_u32(&slot->state, SLOT_READY);
+	}
+	LWLockRelease(h->ring_consumer_lock);
+}
+
+/*
+ * Reclamation pass. A producer that ereports between reserving a slot
+ * (EMPTY->WRITING) and publishing it (WRITING->READY) leaves write_head
+ * UNCHANGED, so the only place a stuck WRITING slot can sit is AT write_head
+ * (the next-to-publish position). Check that slot; if it has been WRITING
+ * longer than ring_slot_stuck_timeout, CAS it back to EMPTY so producers can
+ * reserve it again. Returns the number reclaimed (0 or 1). Under
+ * ring_consumer_lock.
+ */
+int
+pg_redis_dirty_ring_reclaim_stuck(void)
+{
+	PgRedisSharedHeader *h = pg_redis_shmem_header();
+	PgRedisDirtyEvent *slot;
+	uint64		w;
+	uint32		expected = SLOT_WRITING;
+	int			reclaimed = 0;
+	TimestampTz now;
 
 	if (h == NULL || ring_slots == NULL || ring_capacity <= 0)
 		return 0;
 
+	LWLockAcquire(h->ring_consumer_lock, LW_EXCLUSIVE);
 	w = pg_atomic_read_u64(&h->ring_write_head);
-	r = pg_atomic_read_u64(&h->ring_read_head);
+	slot = &ring_slots[w % ring_capacity];
+	now = GetCurrentTimestamp();
 
-	while (drained < max && r < w)
+	if (pg_atomic_read_u32(&slot->state) == SLOT_WRITING &&
+		TimestampDifferenceExceeds(slot->write_started_at, now,
+								   pg_redis_ring_slot_stuck_timeout_ms))
 	{
-		PgRedisDirtyEvent *slot = &ring_slots[r % ring_capacity];
-		uint32		expected = SLOT_READY;
-
-		if (!pg_atomic_compare_exchange_u32(&slot->state, &expected, SLOT_DRAINING))
-		{
-			/* Producer hasn't finished filling this slot. Bail out and
-			 * let the next drain pick it up. */
-			break;
-		}
-
-		pg_read_barrier();
-		out_buf[drained] = *slot;
-
-		pg_atomic_write_u32(&slot->state, SLOT_EMPTY);
-		r++;
-		drained++;
+		/* A live producer never lingers >timeout between reserve and publish,
+		 * so this slot belongs to a crashed/aborted producer. CAS so we don't
+		 * race a producer that just (re)reserved it. */
+		if (pg_atomic_compare_exchange_u32(&slot->state, &expected, SLOT_EMPTY))
+			reclaimed = 1;
 	}
 
-	if (drained > 0)
-		pg_atomic_write_u64(&h->ring_read_head, r);
-
-	return drained;
+	LWLockRelease(h->ring_consumer_lock);
+	return reclaimed;
 }
 
 int
@@ -245,25 +454,27 @@ pg_redis_dirty_ring_drop_all_pending(void)
 	if (h == NULL || ring_slots == NULL || ring_capacity <= 0)
 		return 0;
 
-	w = pg_atomic_read_u64(&h->ring_write_head);
+	LWLockAcquire(h->ring_consumer_lock, LW_EXCLUSIVE);
 	r = pg_atomic_read_u64(&h->ring_read_head);
+	w = pg_atomic_read_u64(&h->ring_write_head);
 
 	while (r < w)
 	{
 		PgRedisDirtyEvent *slot = &ring_slots[r % ring_capacity];
-		uint32		expected = SLOT_READY;
+		uint32		st = pg_atomic_read_u32(&slot->state);
 
-		if (!pg_atomic_compare_exchange_u32(&slot->state, &expected, SLOT_DRAINING))
-		{
-			/* Producer mid-fill — caller is supposed to hold all partition
-			 * locks so this shouldn't happen, but be defensive. Bail. */
+		/* Drop READY and already-DRAINING slots (freeing their spill payloads).
+		 * Stop at a WRITING boundary slot — that belongs to a live producer
+		 * mid-publish; the reclaim pass handles a stuck one. */
+		if (st != SLOT_READY && st != SLOT_DRAINING)
 			break;
-		}
 
-		pg_read_barrier();
 		if (slot->dsa_overflow && slot->dsa_payload != InvalidDsaPointer)
+		{
 			pg_redis_shared_pfree(slot->dsa_payload);
-
+			slot->dsa_payload = InvalidDsaPointer;
+			slot->dsa_overflow = 0;
+		}
 		pg_atomic_write_u32(&slot->state, SLOT_EMPTY);
 		r++;
 		dropped++;
@@ -272,6 +483,7 @@ pg_redis_dirty_ring_drop_all_pending(void)
 	if (dropped > 0)
 		pg_atomic_write_u64(&h->ring_read_head, r);
 
+	LWLockRelease(h->ring_consumer_lock);
 	return dropped;
 }
 

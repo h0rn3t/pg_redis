@@ -36,7 +36,19 @@ typedef enum PgRedisDirtyEventType
 
 typedef struct PgRedisDirtyEvent
 {
-	pg_atomic_uint32 state;		/* 0 = empty, 1 = writing, 2 = ready, 3 = drained */
+	/* Slot lifecycle, CAS'd by producers and the consumer:
+	 *   SLOT_EMPTY(0) -> SLOT_WRITING(1) -> SLOT_READY(2) -> SLOT_DRAINING(3) -> SLOT_EMPTY
+	 * A producer reserves EMPTY->WRITING, fills the payload, then publishes
+	 * WRITING->READY (and only then advances write_head). The consumer's
+	 * collect phase CAS's READY->DRAINING; the post-commit release phase flips
+	 * DRAINING->EMPTY (success) or the abort path resets DRAINING->READY. */
+	pg_atomic_uint32 state;
+
+	/* GetCurrentTimestamp() stamped when the slot is reserved (EMPTY->WRITING).
+	 * The consumer's reclamation pass uses it to reset slots stuck in WRITING
+	 * (producer ereport'd between reserve and publish) after a grace period. */
+	TimestampTz write_started_at;
+
 	PgRedisDirtyEventType type;
 	PgRedisValueType value_type;	/* for KEY_UPSERT: string vs int vs hash vs list */
 
@@ -70,25 +82,93 @@ extern void pg_redis_dirty_ring_shmem_attach(void *slot_area, int slot_count);
  * should call this. Backends that attach to existing shmem skip this. */
 extern void pg_redis_dirty_ring_shmem_init(void *slot_area, int slot_count);
 
-/* Producer-side API. Returns the slot it wrote into; raises ERROR on
- * insufficient_resources when in 'block' mode and the ring is full past the
- * spin budget. */
-extern void pg_redis_dirty_ring_publish(const PgRedisDirtyEvent *ev);
+/* Result of a single (mechanism-only) publish attempt. */
+typedef enum PgRedisRingPublishResult
+{
+	PG_REDIS_RING_OK = 0,		/* event reserved, written, and published */
+	PG_REDIS_RING_FULL			/* no free slot — caller applies backpressure */
+}			PgRedisRingPublishResult;
 
-/* Consumer (BGW) drain. Returns count copied (0 if nothing pending). */
-extern int	pg_redis_dirty_ring_drain(PgRedisDirtyEvent *out_buf, int max);
+/*
+ * Producer-side, mechanism only. Two-phase reservation: CAS a free slot
+ * EMPTY->WRITING, write the payload, publish WRITING->READY, then advance
+ * write_head. Returns PG_REDIS_RING_FULL (without touching shared state) when
+ * the ring is full. NEVER drains and NEVER raises an error — the caller
+ * applies the pg_redis.async_full_action backpressure policy (which may
+ * require releasing a partition LWLock before draining). On PG_REDIS_RING_FULL
+ * the event's DSA spill payload (if any) is still owned by the caller and must
+ * be freed by it.
+ */
+extern PgRedisRingPublishResult pg_redis_dirty_ring_publish(const PgRedisDirtyEvent *ev);
+
+/*
+ * Producer-side, for callers holding NO pg_redis LWLock. Applies
+ * pg_redis.async_full_action on a full ring: 'block' spins (waking the BGW)
+ * up to the spin budget then raises insufficient_resources; 'sync_flush'
+ * drains synchronously via pg_redis_persistence_sync_drain then retries.
+ * Loops until the event is published or it raises. Frees the event's DSA spill
+ * payload on the error path (hence a non-const event).
+ */
+extern void pg_redis_dirty_ring_publish_blocking(PgRedisDirtyEvent *ev);
+
+/*
+ * Consumer-side, two-phase drain (Decision 11). Phase 1 "collect": under
+ * ring_consumer_lock, copy up to `max` READY events starting at read_head into
+ * out_buf, CAS'ing each consumed slot READY->DRAINING. Does NOT advance
+ * read_head and does NOT free slots. Stops at the first non-READY slot.
+ * Returns the count and writes the consumed base position (= read_head at
+ * entry) into *out_base. The caller MUST hold no partition LWLock.
+ */
+extern int	pg_redis_dirty_ring_collect(PgRedisDirtyEvent *out_buf, int max,
+										uint64 *out_base);
+
+/*
+ * Phase 3 "release" (success path): after the batch's durable write has been
+ * executed, advance read_head past the batch, flip the DRAINING slots to
+ * EMPTY, and free each event's DSA spill payload exactly once. Under
+ * ring_consumer_lock.
+ */
+extern void pg_redis_dirty_ring_release_batch(const PgRedisDirtyEvent *batch,
+											  uint64 base, int n);
+
+/*
+ * Phase 3 "abort" (failure path): the durable write raised before commit.
+ * Reset the batch's DRAINING slots back to READY and leave read_head
+ * unchanged, so the events remain in the ring for a subsequent drain
+ * (at-least-once). Does NOT free DSA payloads (the slots still own them).
+ * Under ring_consumer_lock.
+ */
+extern void pg_redis_dirty_ring_abort_batch(const PgRedisDirtyEvent *batch,
+											uint64 base, int n);
+
+/*
+ * Reclamation pass: scan [read_head, write_head] and reset any slot stuck in
+ * SLOT_WRITING longer than pg_redis.ring_slot_stuck_timeout (producer ereport'd
+ * between reserve and publish) back to SLOT_EMPTY, unblocking producers. Run by
+ * the BGW every pg_redis.ring_reclaim_tick_interval drain ticks. Returns the
+ * number of slots reclaimed. Takes ring_consumer_lock. */
+extern int	pg_redis_dirty_ring_reclaim_stuck(void);
 
 /* Discard every currently-pending event without persisting it. Frees any
  * DSA-overflow payloads so they don't leak. Returns the number of events
  * dropped. Used by FLUSHALL in async mode (the durable rows are being
  * TRUNCATE'd, so pending events would be redundant or worse, resurrecting
- * deleted keys). Caller MUST hold every partition LWLock exclusively to
- * keep producers out for the duration of the drop. */
+ * deleted keys). Takes ring_consumer_lock (it advances read_head); may be
+ * called while holding partition LWLocks (FLUSHALL) — the partition->consumer
+ * nesting has no reverse edge, so it cannot deadlock. */
 extern int	pg_redis_dirty_ring_drop_all_pending(void);
 
 /* Counters helpers. */
 extern uint64 pg_redis_dirty_ring_pending(void);
 extern bool pg_redis_dirty_ring_full(void);
+
+/* Diagnostic snapshot of the ring (for the pgredis."RING_INSPECT"() SQL fn and
+ * invariant tests). Reads atomics without the consumer lock, so the result is a
+ * best-effort instantaneous view. Any out pointer may be NULL. */
+extern void pg_redis_dirty_ring_inspect(uint64 *out_write_head,
+										uint64 *out_read_head,
+										uint64 *out_pending,
+										int32 *out_stuck_writing);
 
 /* --- Producer-side encoders ---
  *

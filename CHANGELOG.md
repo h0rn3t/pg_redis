@@ -1,13 +1,75 @@
-# Changelog
+# Журнал змін
 
-## Unreleased
+## [1.2] — Зміцнення crash-safety
 
-### Fixed
+Аудит crash-safety виявив кластер з runtime-небезпек, які наявний набір тестів ніколи не покривав, але які доступні під час тривалого виробничого навантаження. Позначки серйозності: **PANIC** (крах бекенду), **SEGV** (segfault), **corruption** (тихо неправильні дані / заклинена структура), **hang** (дедлок або нескінченна петля).
 
-- **Shared-mode HSET silently truncated hash-field values larger than 65535 bytes.** The `PgRedisSharedHashBucket.value_len` field is `uint16`; values larger than that wrote full bytes to DSA but recorded a truncated length, causing HGET to return garbled data. `pg_redis_shared_hash_set` now rejects oversize values up front with `ERRCODE_PROGRAM_LIMIT_EXCEEDED`. **BREAKING**: previously-succeeding-but-silently-corrupting HSETs of hash values >64 KB under `storage_mode='shared'` now error. The 1 MB top-level `pg_redis.max_value_size` cap still applies to top-level STRING values.
-- **Async-drain leaked DSA spill payloads on SPI errors.** `pg_redis_persistence_async_drain` consumed events from the dirty ring before running SPI plans; any `SPI_execute_plan` failure (or `SPI_connect` failure) skipped the cleanup loop, permanently leaking the spilled DSA chunks of every drained event. Drain is now wrapped in `PG_TRY`/`PG_CATCH` that releases the payloads before re-raising.
-- **`pg_redis_shared_store_reset_all` documents a caller-holds-locks precondition.** Reviewed in the context of `pg_redis_flushall` — the SQL entry point already acquires every partition LWLock exclusively (and wraps the sweep in `PG_FINALLY` to release). The previous code worked correctly because of that, but the contract was implicit; comments now make it explicit and warn against helper-level self-acquire (which would deadlock since LWLocks are not reentrant).
-- **Multi-step DSA allocators leaked on OOM.** `populate_shared_from_scratch` rebuilds a shared hash table or list element-by-element. An OOM partway through previously left every allocation up to that point unreferenced. Both branches now roll back via `PG_TRY` / `PG_CATCH`, calling `pg_redis_shared_hash_free` or `pg_redis_shared_list_free` on the partially-built structure before re-throwing.
-- **DSA attach failure could orphan `startup_lock` and `CurrentResourceOwner`.** `pg_redis_shmem_dsa()` cleared `CurrentResourceOwner` to pin the dsa_area into `TopMemoryContext`; if any of `dsa_create` / `dsa_attach` / `dsa_pin` / `dsa_pin_mapping` raised, the longjmp left both the resource owner and the startup lock in a bad state. The DSA attach is now inside a `PG_TRY` block that restores all three on error.
-- **`materialize` / `lpop` / `rpop` could segfault on a corrupt bucket.** They dereferenced the result of `pg_redis_shared_addr()` without a NULL check, so a bucket marked OCCUPIED whose `field_dsa` resolved to NULL would crash the backend. Added defensive NULL checks: materialize skips the bucket, pop returns false.
-- **`find_bucket` could in theory loop forever.** The linear-probe loop relied implicitly on the grow-at-0.7 invariant always leaving an EMPTY slot. Added a probe-count bound of `bucket_count`; if exhausted (a future regression in the grow path), the function raises `ERRCODE_INTERNAL_ERROR` instead of hanging.
+**Процедура оновлення (BREAKING — зміна розкладки у спільній пам'яті):** спільна HTAB-ка скинула `HASH_PARTITION`, змінивши її розкладку у shmem. Спільна пам'ять перебудовується з надійних таблиць при старті постмайстра, тому після встановлення бінарника 1.2 НЕОБХІДНО перезапустити кластер; або виконати `DROP EXTENSION pg_redis; CREATE EXTENSION pg_redis;`. Надійні таблиці (`pgredis.store`, `hash_fields`, `list_items`, …) та бінарний формат значень TLV **не змінені** — міграція даних не потрібна.
+
+### Виправлення crash-safety
+
+- **[PANIC / corruption] Переповнення цілого числа при розмірі HTAB.** `estimate_max_entries`
+  обчислювала `int * 1024 * 1024`, переповнюючи знаковий `int` при
+  `pg_redis.shared_max_memory_mb >= 2048` і мовчки обмежуючи спільну HTAB
+  до нижньої межі у 1024 записи; кластер тоді падав з PANIC щоразу,
+  як `hash_search(HASH_ENTER)` намагалася вийти за це обмеження. Арифметика тепер виконується у типі
+  `Size`. **BREAKING:** інсталяції з > 2 ГБ тепер виділяють запрошену ємність замість мовчазного обмеження.
+- **[hang] SPI під `startup_lock` під час cold-start завантаження.** Ліниве перезавантаження
+  тримало `startup_lock` крізь `SPI_connect … SPI_finish`, спричиняючи дедлок при
+  одночасному cold-start. Завантаження тепер координується атомарним
+  автоматом станів `unloaded → loading → loaded` з `WaitLatch`-поллінгом та
+  30-секундним watchdog'ом — жоден pg_redis LWLock не тримається крізь завантаження.
+- **[hang / PANIC] SPI під partition LWLock у `sync_flush`-дренажі.** Тепер
+  продюсер звільняє partition-лок, виконує дренаж без жодного pg_redis LWLock,
+  заново береться за лок, повторно валідує запис і повторює спробу.
+- **[hang] `write_head` брудного кільця просувався до підтвердження права на слот.** Продюсер,
+  що перервався посеред запису, залишав постійну діру, яка зупиняла консьюмера.
+  Резервування тепер двофазне (CAS EMPTY→WRITING, запис, WRITING→READY, потім
+  просування `write_head`); прохід рекламації консьюмера скидає слоти, які застрягли у
+  WRITING понад `pg_redis.ring_slot_stuck_timeout`.
+- **[hang] `dsa_create` під partition LWLock.** DSA тепер приєднується
+  жадібно на бекенд перед будь-яким partition-локом;
+  `pg_redis_shmem_dsa()` є чистим акцесором.
+- **[corruption] Внутрішній розділ HTAB розійшовся із зовнішнім локом.**
+  `HASH_PARTITION` (розбиття за `string_hash`) прибрано; зовнішні
+  partition LWLock'и (`hash_bytes`) є єдиною серіалізацією, а HTAB
+  попередньо розміщується до `max_entries` — він ніколи не змінює розмір.
+- **[corruption / data-loss] TOAST-стиснені значення мовчки відкидалися при завантаженні.**
+  Три місця завантаження тепер використовують `PG_DETOAST_DATUM` (повне розтискання/декомпресія)
+  замість `DatumGetByteaPP`, який залишав inline-стиснені значення стисненими
+  і призводив до помилки перевірки TLV-тегу.
+- **[hang] Bgworker мав закодований `postgres` як базу даних.** Ціль тепер
+  налаштовується через `pg_redis.bgworker_database`, а воркер реєструється як
+  `BGW_NEVER_RESTART`, щоб відсутня база даних призводила до чистого виходу, а не циклічного перезапуску.
+- **[PANIC] Шлях помилки дренажу залишав відкритою SPI-сесію та snapshot.** `PG_CATCH`
+  тепер відстежує `spi_connected` / `snapshot_pushed` та ідемпотентно викликає
+  `PopActiveSnapshot` / `SPI_finish` перед повторним підняттям помилки.
+- **[corruption] Одночасні дренери брудного кільця пошкоджували `read_head` (C2).** Виділений
+  `ring_consumer_lock` тепер серіалізує кожного дренера (BGW і
+  `sync_flush`-продюсери); це листовий лок, який ніколи не тримається разом з partition-локом.
+- **[data-loss] Дренаж просував `read_head` до надійного коміту (C3).** Дренаж
+  тепер двофазний: збір (слоти → DRAINING, `read_head` без змін),
+  персистування, потім просування `read_head` та звільнення слотів; при помилці персистування слоти
+  скидаються до READY, а події залишаються у кільці (at-least-once). Замінює тимчасовий захід `harden-shared-memory-error-paths` D2.
+- **[hang] FLUSHALL виконував `TRUNCATE` під усіма partition LWLock'ами (M1).** FLUSHALL
+  тепер скидає пам'ять під partition-локами, звільняє їх, потім видаляє незафіксовані
+  події кільця та виконує `TRUNCATE` без жодного pg_redis LWLock. Замінює
+  `harden-shared-memory-error-paths` D3.
+
+### Додано
+
+- GUC-и `pg_redis.bgworker_database` (PGC_POSTMASTER, типово `postgres`),
+  `pg_redis.ring_reclaim_tick_interval` (типово 1024 тіків) та
+  `pg_redis.ring_slot_stuck_timeout` (типово 5 с).
+- Діагностичні SQL-функції `pgredis."RING_INSPECT"()`, `pgredis."LOAD_STATE"()` та
+  `pgredis."LWLOCK_DIAG"()`.
+
+### Тимчасові захисти (також є у 1.2; з `harden-shared-memory-error-paths`)
+
+- **HSET у режимі shared мовчки обрізав значення хеш-полів більше 65535 байт.** Поле `PgRedisSharedHashBucket.value_len` має тип `uint16`; значення більшого розміру записували повну кількість байтів у DSA, але зберігали обрізану довжину, через що HGET повертав спотворені дані. `pg_redis_shared_hash_set` тепер заздалегідь відхиляє занадто великі значення з `ERRCODE_PROGRAM_LIMIT_EXCEEDED`. **BREAKING**: HSET хеш-значень >64 КБ у `storage_mode='shared'`, що раніше «вдавалися», але мовчки псували дані, тепер повертає помилку. Верхня межа 1 МБ `pg_redis.max_value_size` і надалі діє для верхньорівневих STRING-значень.
+- **Async-дренаж пропускав DSA spill-пейлоади при SPI-помилках.** `pg_redis_persistence_async_drain` споживав події з брудного кільця перед запуском SPI-планів; будь-яка помилка `SPI_execute_plan` (або `SPI_connect`) пропускала петлю очищення, назавжди пропускаючи DSA-чанки spill-пейлоадів кожної спустошеної події. Дренаж тепер загорнутий у `PG_TRY`/`PG_CATCH`, який звільняє пейлоади перед повторним підняттям помилки.
+- **`pg_redis_shared_store_reset_all` документує передумову «викликач тримає локи».** Перевірено в контексті `pg_redis_flushall` — SQL-точка входу вже бере кожен partition LWLock ексклюзивно (і огортає прохід у `PG_FINALLY` для звільнення). Попередній код працював правильно саме через це, але контракт був неявним; коментарі тепер роблять його явним і попереджають проти самостійного взяття локів на рівні хелперів (що призводило б до дедлоку, оскільки LWLock'и не реентерабельні).
+- **Багатокрокові DSA-алокатори протікали при OOM.** `populate_shared_from_scratch` відновлює спільну хеш-таблицю або список поелементно. Раніше OOM посередині залишав кожну попередню алокацію без посилань. Обидві гілки тепер відкочуються через `PG_TRY` / `PG_CATCH`, викликаючи `pg_redis_shared_hash_free` або `pg_redis_shared_list_free` на частково побудованій структурі перед повторним підняттям помилки.
+- **Помилка при DSA attach могла осиротити `startup_lock` та `CurrentResourceOwner`.** `pg_redis_shmem_dsa()` очищав `CurrentResourceOwner`, щоб закріпити dsa_area у `TopMemoryContext`; якщо будь-яка з `dsa_create` / `dsa_attach` / `dsa_pin` / `dsa_pin_mapping` кидала виключення, longjmp залишав обидва — resource owner і startup lock — у поганому стані. DSA attach тепер всередині блоку `PG_TRY`, який відновлює все трьоє при помилці.
+- **`materialize` / `lpop` / `rpop` могли segfault на зіпсованому бакеті.** Вони розіменовували результат `pg_redis_shared_addr()` без перевірки на NULL, тому бакет, позначений OCCUPIED, у якого `field_dsa` перетворювався на NULL, призводив до краш бекенду. Додано захисні NULL-перевірки: materialize пропускає бакет, pop повертає false.
+- **`find_bucket` теоретично міг зациклитися.** Петля лінійного зондування неявно розраховувала на те, що інваріант «зростання при 0.7» завжди залишає порожній слот. Додано обмеження кількості зондувань рівним `bucket_count`; якщо вичерпано (майбутня регресія у шляху зростання), функція кидає `ERRCODE_INTERNAL_ERROR` замість зависання.
